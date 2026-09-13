@@ -120,17 +120,25 @@ async def _reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if auth.is_allowed(settings, user.id if user else None):
         return False
 
+    # Logged once at warning level. The reply below explains to the user what happened.
     log.warning("rejected update from unauthorized user id=%s", user.id if user else None)
 
-    # With an empty allowlist we are in first-run discovery: the owner needs their own id.
-    # Once the allowlist is populated, strangers get silence rather than a reply.
-    if settings.allowlist_open and update.effective_chat and user:
-        await _reply(
-            update,
-            "This bot is not configured yet. Your Telegram user id is:\n\n"
-            f"<code>{user.id}</code>\n\n"
-            "Add it to TG_ALLOWED_IDS in .env and restart.",
-        )
+    if update.effective_chat and user:
+        if settings.allowlist_open:
+            # Empty allowlist means first-run discovery: the owner needs their own id.
+            await _reply(
+                update,
+                "This bot is not configured yet. Your Telegram user id is:\n\n"
+                f"<code>{user.id}</code>\n\n"
+                "Add it to TG_ALLOWED_IDS in .env and restart.",
+            )
+        else:
+            # Populated allowlist with a non-whitelisted user: they don't have access.
+            await _reply(
+                update,
+                "Sorry, access to this bot is restricted to authorized users only. "
+                "Please contact your administrator if you believe you should have access."
+            )
     return True
 
 
