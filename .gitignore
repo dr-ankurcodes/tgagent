@@ -1,0 +1,28 @@
+# Credentials. Never commit these: QODER_PAT bills real credits and TG_BOT_TOKEN
+# lets anyone impersonate the bot.
+.env
+.env.*
+!.env.example
+
+# Local state. The database holds every conversation transcript, and the file cache
+# holds the bytes users sent and the agent produced.
+*.db
+*.db-shm
+*.db-wal
+filecache/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
