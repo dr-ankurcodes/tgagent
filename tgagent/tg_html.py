@@ -151,12 +151,27 @@ def decoded_length(html: str) -> int:
 def _fence_reserve(text: str) -> int:
     """Room to leave for the closing fence ``balance_fences`` may append to a cut of ``text``.
 
-    Sized from the block actually open, not from a fixed three: a four-backtick block needs a
-    four-backtick closer, and under-reserving would let the cut overflow the cap.
+    Sized for the LONGEST fence marker that appears anywhere in ``text``, not for the block open
+    at the end of the whole string. The cut point is unknown when the budget is computed, and a
+    prefix can be open inside a longer block than the full text is: ``"```` a ``` b"`` balances
+    overall, but a cut landing in the first block leaves a four-backtick fence open, whose closer
+    is four backticks. Reserving only three — what the whole-text scan reported — let the head
+    overflow the cap after ``balance_fences`` appended its longer closer, which Telegram then
+    rejected whole.
+
+    Reserving for the longest marker bounds the closer for EVERY possible cut, which is what
+    keeps the binary search in :func:`_max_hard_cut` valid: its predicate stays monotonic because
+    the reserve no longer depends on the unknown cut point. When no fence appears at all, no
+    prefix can be left open, so nothing is reserved.
     """
-    is_open, opener = fence_state(text)
-    marker = _closing_marker(opener) if is_open else _FENCE
-    return utf16_length(escape(f"\n{marker}"))
+    longest = 0
+    for line in text.split("\n"):
+        match = _fence_match(line)
+        if match is not None:
+            longest = max(longest, len(match[0]))
+    if longest == 0:
+        return 0
+    return utf16_length(escape(f"\n{'`' * longest}"))
 
 
 def _max_hard_cut(text: str, limit: int) -> int:
@@ -250,9 +265,41 @@ def scrub_ids(text: str) -> str:
     return _ID_PATTERN.sub("[id]", text)
 
 
+def plain(html: str) -> str:
+    """Rendered HTML back to plain text: our tags removed, the three entities collapsed.
+
+    Used for the over-cap fallback in the renderer, where a string that must be sent with no
+    parse mode cannot carry markup or ``&amp;``-style entities.
+    """
+    return _unescape(_TAG_RE.sub("", html))
+
+
+def _utf16_slice(text: str, units: int) -> str:
+    """Longest prefix of ``text`` whose UTF-16 length is at most ``units``.
+
+    Cuts on a code-unit boundary; a trailing lone surrogate from splitting an astral character is
+    tolerated by ``surrogatepass`` and counts as the single unit Telegram would see.
+    """
+    if units <= 0:
+        return ""
+    encoded = text.encode("utf-16-le", "surrogatepass")
+    if len(encoded) // 2 <= units:
+        return text
+    return encoded[: units * 2].decode("utf-16-le", "surrogatepass")
+
+
 def truncate(text: str, limit: int) -> str:
-    """One-line summary for status displays."""
+    """One-line summary for status displays, bounded by UTF-16 code units.
+
+    Telegram counts UTF-16 units, not Python code points, so measuring with ``len()`` let an
+    emoji-heavy summary undercount and still be rejected as too long. A ``limit`` of zero or
+    less returns an empty string rather than a lone ellipsis that itself exceeds the budget.
+    """
     flat = " ".join(text.split())
-    if len(flat) <= limit:
+    if utf16_length(flat) <= limit:
         return flat
-    return flat[: max(0, limit - 1)].rstrip() + "…"
+    if limit <= 0:
+        return ""
+    ellipsis = "…"
+    budget = max(0, limit - utf16_length(ellipsis))
+    return _utf16_slice(flat, budget).rstrip() + ellipsis

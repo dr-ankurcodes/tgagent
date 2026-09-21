@@ -19,7 +19,7 @@ import logging
 
 from . import auth, config
 from .db import Database
-from .qclient import NotFound, QoderError, iter_pages
+from .qclient import NotFound, QoderError, Unauthorized, iter_pages
 from .qsessions import QoderAPI
 
 log = logging.getLogger("tgagent.memory")
@@ -61,32 +61,47 @@ async def ensure_memory_store(
         _forget(db, tg_user_id)
 
     name = config.memstore_name(tg_user_id)
-    try:
-        async for store in iter_pages(api.client, "/memory_stores"):
-            if store.get("name") == name and not store.get("archived_at"):
-                _remember(db, tg_user_id, store["id"])
-                log.info("adopted existing memory store %s for user %s", store["id"], tg_user_id)
-                return store["id"]
-    except QoderError as exc:
-        log.warning("could not list memory stores (%s); creating a new one", exc.message)
+    async with api.provision_lock(tg_user_id):
+        # Double-check the cache INSIDE the lock. The read above happened before we acquired it,
+        # so a concurrent caller for the same user (a DM and a group topic opening at once) may
+        # have provisioned the store while we waited. Without this re-read both callers would
+        # fall through to list-and-create and mint duplicate stores, orphaning one remotely.
+        refreshed = auth.get_user(db, tg_user_id)
+        if refreshed and refreshed["memstore_id"]:
+            return refreshed["memstore_id"]
 
-    try:
-        created = await api.client.post(
-            "/memory_stores",
-            {"name": name, "description": f"Long-term memory for Telegram user {tg_user_id}"},
-        )
-    except QoderError as exc:
-        log.warning("memory store creation failed for user %s: %s", tg_user_id, exc.message)
-        return None
+        try:
+            async for store in iter_pages(api.client, "/memory_stores"):
+                if store.get("name") == name and not store.get("archived_at"):
+                    _remember(db, tg_user_id, store["id"])
+                    log.info("adopted existing memory store %s for user %s", store["id"], tg_user_id)
+                    return store["id"]
+        except Unauthorized as exc:
+            # An auth failure is not "the list didn't work, try creating instead": the create
+            # would fail the same way, and logging it as a fallthrough masked a dead or
+            # scope-less PAT behind the creation error that followed.
+            log.warning("could not list memory stores: credentials rejected (%s)", exc.message)
+            return None
+        except QoderError as exc:
+            log.warning("could not list memory stores (%s); creating a new one", exc.message)
 
-    store_id = created.get("id")
-    if not store_id:
-        log.warning("memory store response had no id: %s", created)
-        return None
+        try:
+            created = await api.client.post(
+                "/memory_stores",
+                {"name": name, "description": f"Long-term memory for Telegram user {tg_user_id}"},
+            )
+        except QoderError as exc:
+            log.warning("memory store creation failed for user %s: %s", tg_user_id, exc.message)
+            return None
 
-    _remember(db, tg_user_id, store_id)
-    log.info("created memory store %s for user %s", store_id, tg_user_id)
-    return store_id
+        store_id = created.get("id")
+        if not store_id:
+            log.warning("memory store response had no id: %s", created)
+            return None
+
+        _remember(db, tg_user_id, store_id)
+        log.info("created memory store %s for user %s", store_id, tg_user_id)
+        return store_id
 
 
 def _remember(db: Database, tg_user_id: int, store_id: str) -> None:

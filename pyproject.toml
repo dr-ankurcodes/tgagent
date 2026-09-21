@@ -1,8 +1,10 @@
 [project]
 name = "tgagent"
-version = "0.1.0"
 description = "Telegram remote control for Qoder Cloud Agents"
 requires-python = ">=3.10"
+# Single-sourced from tgagent.__version__, which qclient also reads for its User-Agent, so a
+# bump cannot leave the package metadata and the running bot disagreeing.
+dynamic = ["version"]
 dependencies = [
     "python-telegram-bot[job-queue]==22.8",
     "httpx>=0.27,<0.29",
@@ -17,3 +19,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["tgagent"]
+
+[tool.setuptools.dynamic]
+version = {attr = "tgagent.__version__"}

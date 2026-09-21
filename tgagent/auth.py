@@ -20,31 +20,113 @@ from typing import Sequence
 from .config import Settings
 from .db import Database, utcnow
 
+# kv key under which the runtime allowlist is persisted. Once the administrator changes access
+# from Telegram, THIS — not the TG_ALLOWED_IDS environment seed — is authoritative across boots,
+# so a user removed with /disallow stays removed rather than being re-added from env on restart.
+KV_ALLOWED_IDS = "allowed_ids"
 
-def is_allowed(settings: Settings, tg_user_id: int | None) -> bool:
-    """Gate every inbound update. An empty allowlist admits nobody."""
-    if tg_user_id is None:
-        return False
-    return tg_user_id in settings.allowed_ids
+
+class AccessControl:
+    """Runtime authority on who may use the bot, and who administers it.
+
+    Two halves with deliberately different lifetimes:
+
+    * ``admin_id`` is fixed from the environment (TG_ADMIN_ID) and is NEVER writable at runtime.
+      It is the root of trust — whoever holds it can change the allowlist and rotate the API
+      token — so letting it be changed from a chat would mean a compromised session could hand
+      an attacker the keys. Telegram's Bot API offers no way to discover who owns a bot, so the
+      operator names their own id at deploy time.
+    * ``allowed_ids`` is mutable from Telegram via /allow and /disallow. It is seeded from
+      TG_ALLOWED_IDS on first run, then persisted to the ``kv`` table; once persisted, the stored
+      set wins over env so a removal survives a restart.
+
+    The administrator is always allowed, listed or not, so a deployment that sets only TG_ADMIN_ID
+    is immediately usable by its owner, who can then populate the allowlist from the chat.
+
+    Mutating methods contain no ``await``, so under asyncio's single thread each runs to
+    completion without interleaving — no lock is needed for the read-modify-persist sequence.
+    """
+
+    def __init__(self, db: Database, *, admin_id: int | None, seed_allowed):
+        self.db = db
+        self.admin_id = admin_id
+        stored = db.kv_get(KV_ALLOWED_IDS)
+        if stored is not None:
+            self.allowed_ids: set[int] = _parse_stored_ids(stored)
+        else:
+            self.allowed_ids = set(seed_allowed)
+
+    @property
+    def discovery_mode(self) -> bool:
+        """An empty allowlist: admit nobody but the admin, and tell knockers their own id."""
+        return not self.allowed_ids
+
+    def is_admin(self, tg_user_id: int | None) -> bool:
+        return tg_user_id is not None and self.admin_id is not None and tg_user_id == self.admin_id
+
+    def is_allowed(self, tg_user_id: int | None) -> bool:
+        """Gate every inbound update. The admin always passes; an empty allowlist admits nobody else."""
+        if tg_user_id is None:
+            return False
+        if self.is_admin(tg_user_id):
+            return True
+        return tg_user_id in self.allowed_ids
+
+    def add(self, tg_user_id: int) -> None:
+        self.allowed_ids.add(tg_user_id)
+        self._persist()
+
+    def remove(self, tg_user_id: int) -> None:
+        self.allowed_ids.discard(tg_user_id)
+        self._persist()
+
+    def snapshot(self) -> list[int]:
+        """The allowlist, sorted, excluding the admin (who is allowed implicitly)."""
+        return sorted(self.allowed_ids)
+
+    def _persist(self) -> None:
+        self.db.kv_set(KV_ALLOWED_IDS, ",".join(str(i) for i in sorted(self.allowed_ids)))
+
+
+def _parse_stored_ids(raw: str) -> set[int]:
+    """Parse a value this module wrote with ``_persist``. Tolerates blanks; never raises."""
+    ids: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part:
+            try:
+                ids.add(int(part))
+            except ValueError:
+                continue
+    return ids
 
 
 def ensure_user(db: Database, settings: Settings, tg_user_id: int, handle: str | None) -> sqlite3.Row:
-    """Create the user row on first contact and return it."""
-    existing = db.query_one("SELECT * FROM users WHERE tg_user_id = ?", (tg_user_id,))
-    if existing:
-        if handle and existing["handle"] != handle:
-            db.execute("UPDATE users SET handle = ? WHERE tg_user_id = ?", (handle, tg_user_id))
-            return db.query_one("SELECT * FROM users WHERE tg_user_id = ?", (tg_user_id,))
-        return existing
+    """Create the user row on first contact and return it.
 
+    Uses an upsert rather than check-then-insert. With ``concurrent_updates(10)`` a message and
+    a command from the same first-contact user can arrive together; two plain INSERTs would race
+    and the loser would raise an unhandled ``IntegrityError`` on the primary key, crashing that
+    user's very first interaction. ``ON CONFLICT DO NOTHING`` makes the insert idempotent, so
+    the row is guaranteed to exist for the re-read regardless of who won.
+    """
     db.execute(
         """INSERT INTO users(tg_user_id, handle, credit_budget, model_id, effort, created_at)
-           VALUES(?, ?, ?, ?, ?, ?)""",
+           VALUES(?, ?, ?, ?, ?, ?)
+           ON CONFLICT(tg_user_id) DO NOTHING""",
         (
             tg_user_id, handle, settings.credit_budget, settings.default_model,
             settings.default_effort, utcnow(),
         ),
     )
+    if handle:
+        # Refresh a changed handle. The NULL-safe comparison means a row inserted moments ago by
+        # the racing caller — possibly with a stale or missing handle — still converges on one
+        # row carrying the latest value, without a second read-modify-write cycle.
+        db.execute(
+            "UPDATE users SET handle = ? WHERE tg_user_id = ? AND (handle IS NULL OR handle != ?)",
+            (handle, tg_user_id, handle),
+        )
     return db.query_one("SELECT * FROM users WHERE tg_user_id = ?", (tg_user_id,))
 
 
@@ -145,9 +227,16 @@ def list_conversations(db: Database, tg_user_id: int, *, include_archived: bool 
 
 
 def switch_active_conversation(db: Database, convo_id: int, tg_user_id: int) -> bool:
-    """Make convo_id the active one for its chat. Returns False if not owned."""
+    """Make convo_id the active one for its chat. Returns False if not owned or archived.
+
+    An archived row is rejected explicitly. :func:`get_conversation` filters on ``deleted_at``
+    but not ``archived_at``, so without this check an archived conversation could be set
+    ``active = 1`` alongside a non-NULL ``archived_at`` — a state :func:`active_conversation`
+    never returns. The user would believe they switched, while their next message silently
+    opened a *new* conversation, and the row would occupy the one-active-per-chat slot doing it.
+    """
     row = get_conversation(db, convo_id, tg_user_id)
-    if row is None:
+    if row is None or row["archived_at"] is not None:
         return False
     with db.transaction():
         db.execute(
@@ -206,9 +295,15 @@ def migrate_chat_id(db: Database, old_chat_id: int, new_chat_id: int) -> int:
 
 
 def update_conversation(db: Database, convo_id: int, tg_user_id: int, **fields) -> bool:
-    """Ownership-checked partial update."""
+    """Ownership-checked partial update.
+
+    Returns True if a matching owned row was updated, False if no row matched. An empty
+    ``fields`` is a programming error rather than a silent no-op: raising here keeps the False
+    return unambiguous ("no matching owned row") for the callers that branch on it, instead of
+    overloading it to also mean "you asked me to write nothing".
+    """
     if not fields:
-        return False
+        raise ValueError("update_conversation requires at least one field to write")
     allowed = {
         "title",
         "session_id",
@@ -295,25 +390,30 @@ def resumable_conversation(
     *,
     convo_id: int | None = None,
 ) -> sqlite3.Row | None:
-    """A conversation in this chat whose session was lost, if any.
+    """A conversation whose session was lost, if any.
 
-    This is the only conversation a silent resume may adopt. An archived one is excluded on
-    purpose: the user closed it deliberately, and quietly reopening it would undo an explicit
-    choice.
-
-    With ``convo_id`` given, that specific conversation is returned — ownership, the lost flag
-    and the chat are all still checked. Without it, the most recent one wins. The targeted form
-    is what makes /sessions' ⟳ RESTORE buttons mean anything: the list shows one button per
-    recoverable conversation, and always resolving to the newest made every button do the same
-    thing and left the older ones unreachable.
+    Without ``convo_id`` given, only conversations in this chat are returned, because that is
+    the path a SILENT resume follows — the user sent a fresh message and nothing should change
+    unless there IS something to resume in this chat. With ``convo_id``, that specific one is
+    returned regardless of which chat the request came from. /sessions lists conversations from
+    every chat (the bot belongs to many), so pressing RESTORE from a DM for a group conversation
+    must not fail just because the originating chat doesn't match the stored one; the convo_id
+    owns the recovery, not the button's chat. Ownership, the lost flag and archived_at ARE still
+    checked. An archived one is excluded: the user closed it deliberately, and quietly reopening
+    it would undo an explicit choice. A lost one was taken away by something outside their control
+    — a rotated PAT makes every session the old token created return 404, and losing the right to
+    post in a chat does the same to the conversation around it — so offering it back is the
+    friendly thing to do.
     """
     if convo_id is not None:
+        # Targeted restore from /sessions: the convo_id is what matters, not where the button
+        # appeared. Ownership, lost_session and archived_at IS NULL are all still checked.
         return db.query_one(
             """SELECT * FROM conversations
-               WHERE convo_id = ? AND tg_user_id = ? AND chat_id = ?
-                 AND lost_session = 1 AND archived_at IS NULL""",
-            (convo_id, tg_user_id, chat_id),
+               WHERE convo_id = ? AND tg_user_id = ? AND lost_session = 1 AND archived_at IS NULL""",
+            (convo_id, tg_user_id),
         )
+    # Un-targeted path (silent resume, /health): restrict to this chat/thread.
     if message_thread_id is None:
         return db.query_one(
             """SELECT * FROM conversations
@@ -363,7 +463,7 @@ def record_tg_file(
         """INSERT INTO tg_files(file_id, owner_tg_user_id, convo_id, filename, mime_type,
                                 size_bytes, mount_path, created_at)
            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(file_id) DO UPDATE SET
+           ON CONFLICT(file_id, owner_tg_user_id) DO UPDATE SET
              mount_path = excluded.mount_path, convo_id = excluded.convo_id""",
         (file_id, owner_tg_user_id, convo_id, filename, mime_type, size_bytes, mount_path, utcnow()),
     )

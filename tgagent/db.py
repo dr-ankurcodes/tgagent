@@ -15,6 +15,7 @@ the database concurrently from different asyncio tasks.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -23,7 +24,9 @@ from typing import Any, Iterator, Sequence
 
 from .config import restrict
 
-SCHEMA_VERSION = 5
+log = logging.getLogger("tgagent.db")
+
+SCHEMA_VERSION = 7
 
 
 def utcnow() -> str:
@@ -154,18 +157,25 @@ CREATE TABLE IF NOT EXISTS inbound_queue (
 
 CREATE INDEX IF NOT EXISTS ix_inbound_pending ON inbound_queue(convo_id, state, id);
 
+-- Telegram dedupes uploads per bot, so the SAME file_id can legitimately arrive from two
+-- different users. Keying on file_id alone made the second upload's ON CONFLICT overwrite the
+-- first user's owner/convo/mount_path, which then hid the file from its real owner and let a
+-- cascade delete on user A wipe user B's live record. The primary key is therefore the pair:
+-- one row per (file, owner), each carrying its own mount_path and convo_id.
 CREATE TABLE IF NOT EXISTS tg_files (
-    file_id         TEXT PRIMARY KEY,
+    file_id         TEXT NOT NULL,
     owner_tg_user_id INTEGER NOT NULL REFERENCES users(tg_user_id) ON DELETE CASCADE,
     convo_id        INTEGER REFERENCES conversations(convo_id) ON DELETE SET NULL,
     filename        TEXT,
     mime_type       TEXT,
     size_bytes      INTEGER,
     mount_path      TEXT,
-    created_at      TEXT NOT NULL
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY(file_id, owner_tg_user_id)
 );
 
 CREATE INDEX IF NOT EXISTS ix_tgf_owner ON tg_files(owner_tg_user_id);
+CREATE INDEX IF NOT EXISTS ix_tgf_convo  ON tg_files(convo_id);
 
 CREATE TABLE IF NOT EXISTS artifacts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -178,6 +188,10 @@ CREATE TABLE IF NOT EXISTS artifacts (
     delivered       INTEGER NOT NULL DEFAULT 0,
     tg_message_id   INTEGER,
     skipped_reason  TEXT,
+    -- Cross-boot retry counter. A transient Telegram failure deliberately leaves the row
+    -- pending so the next boot tries again, but without a cap a file Telegram repeatedly
+    -- refuses was re-downloaded (up to 50 MB into phone RAM) on every start forever.
+    attempts        INTEGER NOT NULL DEFAULT 0,
     discovered_at   TEXT    NOT NULL,
     UNIQUE(convo_id, file_id)
 );
@@ -185,7 +199,11 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE TABLE IF NOT EXISTS spend (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     convo_id        INTEGER REFERENCES conversations(convo_id) ON DELETE SET NULL,
-    tg_user_id      INTEGER NOT NULL,
+    -- FK added for consistency with every other user-owned table. No code path deletes a user
+    -- row (forget_chat operates on conversations), so ON DELETE CASCADE is belt-and-braces;
+    -- databases created before this line lack the constraint and cannot gain it without a
+    -- table rebuild, which is not worth the risk for a deletion that never happens.
+    tg_user_id      INTEGER NOT NULL REFERENCES users(tg_user_id) ON DELETE CASCADE,
     credits         REAL    NOT NULL,
     model           TEXT,
     is_error        INTEGER NOT NULL DEFAULT 0,
@@ -235,15 +253,27 @@ class Database:
     def __init__(self, path: Path):
         self.path = path
         self._depth = 0
+        self._nested_failed = False
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA busy_timeout=5000")
-        self._restrict()
-        self._migrate()
+        try:
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            # FULL, not NORMAL. NORMAL+WAL survives a process crash — which is the common case
+            # on Android — but loses the last committed transactions on an OS crash or battery
+            # pull, and the module docstring promises durable state is committed eagerly because
+            # process death is inevitable. A phone losing power mid-checkpoint is realistic
+            # enough that the fsync cost is the price of keeping that promise.
+            self.conn.execute("PRAGMA synchronous=FULL")
+            self.conn.execute("PRAGMA busy_timeout=5000")
+            self._restrict()
+            self._migrate()
+        except BaseException:
+            # _migrate raises RuntimeError on a newer schema; without this the connection (and
+            # its WAL sidecars) leak for the life of the process.
+            self.conn.close()
+            raise
 
     def _restrict(self) -> None:
         """Owner-only permissions on the database and its WAL sidecars.
@@ -284,11 +314,73 @@ class Database:
             self._add_column_if_missing(
                 "conversations", "lost_session", "INTEGER NOT NULL DEFAULT 0"
             )
+        # No `version < 4` branch: schema v4 was DDL-only (it added rendered_events and kv via
+        # CREATE TABLE IF NOT EXISTS above, with no ALTER). Recorded here so the jump from 3 to 5
+        # is not mistaken for a skipped migration — a column added in a future v4-style step must
+        # get its own branch or it will silently never migrate on an existing database.
         if version < 5:
             self._add_column_if_missing("users", "effort", "TEXT")
+        if version < 6:
+            self._rebuild_tg_files()
+        if version < 7:
+            self._add_column_if_missing("artifacts", "attempts", "INTEGER NOT NULL DEFAULT 0")
 
         self.conn.executescript(DDL_POST_MIGRATION)
         self.kv_set("schema_version", str(SCHEMA_VERSION))
+
+    def _rebuild_tg_files(self) -> None:
+        """Migrate tg_files from a file_id primary key to (file_id, owner_tg_user_id).
+
+        SQLite cannot alter a primary key in place, so the table is rebuilt: create the new
+        shape, copy every row, drop the old table, rename. ``PRAGMA foreign_keys`` is a no-op
+        inside a transaction, so it is toggled around an explicit BEGIN/COMMIT rather than
+        through :meth:`transaction` — and the copy is atomic, so a crash mid-rebuild leaves the
+        old table intact instead of a half-populated new one.
+
+        No other table references tg_files, so the drop cascades nowhere. The old file_id PK
+        guaranteed uniqueness on file_id alone, which the composite key relaxes by design; every
+        existing row already has a distinct (file_id, owner) pair, so the copy cannot conflict.
+        """
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.conn.execute(
+                    """CREATE TABLE tg_files_new (
+                           file_id         TEXT NOT NULL,
+                           owner_tg_user_id INTEGER NOT NULL
+                               REFERENCES users(tg_user_id) ON DELETE CASCADE,
+                           convo_id        INTEGER REFERENCES conversations(convo_id)
+                               ON DELETE SET NULL,
+                           filename        TEXT,
+                           mime_type       TEXT,
+                           size_bytes      INTEGER,
+                           mount_path      TEXT,
+                           created_at      TEXT NOT NULL,
+                           PRIMARY KEY(file_id, owner_tg_user_id)
+                       )"""
+                )
+                self.conn.execute(
+                    """INSERT INTO tg_files_new(file_id, owner_tg_user_id, convo_id, filename,
+                                                mime_type, size_bytes, mount_path, created_at)
+                       SELECT file_id, owner_tg_user_id, convo_id, filename,
+                              mime_type, size_bytes, mount_path, created_at
+                       FROM tg_files"""
+                )
+                self.conn.execute("DROP TABLE tg_files")
+                self.conn.execute("ALTER TABLE tg_files_new RENAME TO tg_files")
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_tgf_owner ON tg_files(owner_tg_user_id)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_tgf_convo ON tg_files(convo_id)"
+                )
+                self.conn.execute("COMMIT")
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
+        finally:
+            self.conn.execute("PRAGMA foreign_keys=ON")
 
     def _add_column_if_missing(self, table: str, column: str, decl: str) -> None:
         """SQLite has no ADD COLUMN IF NOT EXISTS, so the duplicate error is the check."""
@@ -310,34 +402,77 @@ class Database:
         safe today only because NO transaction block awaits: every statement here is
         synchronous and so cannot yield the loop mid-transaction. Keep it that way — if a
         transaction ever needs to await, this must become per-task state first.
+
+        Two failure modes are handled explicitly:
+
+        * A nested block that raises and is CAUGHT by the outer block. Without tracking, the
+          outer would COMMIT the partial work the inner had already abandoned. ``_nested_failed``
+          propagates the failure up so the outermost block rolls back instead.
+        * A COMMIT that fails (SQLITE_BUSY past the timeout, disk I/O error). ``_depth`` would
+          already be 0 but the transaction could remain open on the connection, so every
+          subsequent "autocommit" statement would silently join the zombie and a later stray
+          COMMIT would publish them. A best-effort ROLLBACK after the failure leaves the
+          connection clean; if even that fails the connection is unusable and is closed.
         """
         if self._depth > 0:
             self._depth += 1
             try:
                 yield
+            except BaseException:
+                self._nested_failed = True
+                raise
             finally:
                 self._depth -= 1
             return
 
         self.conn.execute("BEGIN IMMEDIATE")
         self._depth = 1
+        self._nested_failed = False
         try:
             yield
         except BaseException:
             self._depth = 0
+            self._nested_failed = False
             self.conn.execute("ROLLBACK")
             raise
+
         self._depth = 0
-        self.conn.execute("COMMIT")
+        if self._nested_failed:
+            self._nested_failed = False
+            self.conn.execute("ROLLBACK")
+            raise RuntimeError("transaction rolled back: a nested block failed")
+
+        self._nested_failed = False
+        try:
+            self.conn.execute("COMMIT")
+        except sqlite3.Error:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                log.exception("could not roll back after a failed COMMIT; closing connection")
+                try:
+                    self.conn.close()
+                except sqlite3.Error:
+                    pass
+                raise
+            raise
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Cursor:
         return self.conn.execute(sql, params)
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
-        return list(self.conn.execute(sql, params).fetchall())
+        cur = self.conn.execute(sql, params)
+        try:
+            return list(cur.fetchall())
+        finally:
+            cur.close()
 
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
-        return self.conn.execute(sql, params).fetchone()
+        cur = self.conn.execute(sql, params)
+        try:
+            return cur.fetchone()
+        finally:
+            cur.close()
 
     def kv_get(self, key: str) -> str | None:
         row = self.query_one("SELECT v FROM kv WHERE k = ?", (key,))

@@ -118,7 +118,12 @@ async def iter_sse(response: httpx.Response) -> AsyncIterator[Frame]:
                 frame = _build_frame(sse_id, sse_event, "\n".join(data_lines))
                 if frame is not None:
                     yield frame
-            sse_id, sse_event, data_lines = None, None, []
+            # The SSE spec persists the last event id across dispatches; only the event type and
+            # data buffer reset. Resetting sse_id here meant a stream that set ``id:`` once and
+            # then omitted it on later events lost the cursor value for those events. This API
+            # embeds the id in every payload (the ``_build_frame`` fallback), so it worked by
+            # accident — but the parser should follow the spec rather than depend on that.
+            sse_event, data_lines = None, []
             continue
 
         if line.startswith(":"):
@@ -137,11 +142,14 @@ async def iter_sse(response: httpx.Response) -> AsyncIterator[Frame]:
             sse_event = value
         # Any other field (retry:, etc.) is ignored per the SSE spec.
 
-    # Stream closed without a trailing blank line: flush whatever is pending.
+    # Stream closed without a trailing blank line. Per the SSE spec an unterminated event is
+    # DISCARDED, not dispatched: the data may be truncated mid-JSON, and treating it as complete
+    # would mark a partial event as seen and suppress the full version when the reconnect replays
+    # it. The durable cursor still points before this event, so the replay re-delivers it whole.
+    # Dispatching it here was the one path that could turn a truncated frame into a permanently
+    # lost answer.
     if data_lines:
-        frame = _build_frame(sse_id, sse_event, "\n".join(data_lines))
-        if frame is not None:
-            yield frame
+        log.debug("discarding %d unterminated SSE data line(s) at EOF", len(data_lines))
 
 
 def _build_frame(sse_id: str | None, sse_event: str | None, data: str) -> Frame | None:
@@ -162,7 +170,10 @@ def _build_frame(sse_id: str | None, sse_event: str | None, data: str) -> Frame 
 
 FrameHandler = Callable[[Frame], Awaitable[None]]
 CursorGetter = Callable[[], str | None]
-CursorSetter = Callable[[str], None]
+# None is a legal argument: run() clears a poisoned cursor with set_cursor(None) after a 404
+# that history could not repair. The alias used to declare str only, so a setter typed against
+# it (or a NOT NULL column binding) would break on exactly that recovery path.
+CursorSetter = Callable[[str | None], None]
 
 
 @dataclass
@@ -285,26 +296,50 @@ class StreamConsumer:
     def __post_init__(self) -> None:
         self._acks = AckTracker(commit=self.set_cursor)
 
-    def _already_seen(self, event_id: str) -> bool:
+    def _seen_contains(self, event_id: str) -> bool:
+        """Whether this event id has already been rendered. Check only — never records."""
+        return event_id in self._seen_set
+
+    def _mark_seen(self, event_id: str) -> None:
+        """Record an event id as rendered, AFTER the renderer confirmed it.
+
+        Idempotent on purpose: with the mark deferred past ``on_frame``, a reconnect replay
+        could otherwise present the same id twice before the first mark landed, and a duplicate
+        entry in the bounded deque would desynchronise it from ``_seen_set`` — the eviction
+        discards ``_seen[0]`` from the set, so a second copy of that id surviving in the deque
+        would leave the set claiming "unseen" for an id the deque still holds.
+        """
         if event_id in self._seen_set:
-            return True
+            return
         if len(self._seen) == self._seen.maxlen:
             evicted = self._seen[0]
             self._seen_set.discard(evicted)
         self._seen.append(event_id)
         self._seen_set.add(event_id)
-        return False
 
     async def _emit(self, frame: Frame, stop: asyncio.Event) -> bool:
-        """Hand a frame to the renderer. Returns False if it was a duplicate or we are stopping."""
+        """Hand a frame to the renderer. Returns False if it was a duplicate or we are stopping.
+
+        The ack offer and the seen-mark both happen AFTER ``on_frame`` returns, not before. They
+        used to precede the render: an exception in ``on_frame`` (Telegram flood-wait, a network
+        error) then left the id recorded as seen, so the reconnect replay suppressed it as a
+        duplicate and the answer was never delivered — lost until ``PENDING_ACK_MAX``
+        force-advanced the cursor past it or the process restarted. Deferring both means a failed
+        render is simply retried on the next pass. Offering after the render is also safe for
+        acknowledgements: a synchronous ack fired inside ``on_frame`` lands in ``_acked`` first
+        and ``offer`` treats an already-acked id as delivered immediately, while an asynchronous
+        ack cannot interleave because there is no await between the render returning and the
+        offer.
+        """
         if stop.is_set():
             return False
         event_id = frame.event_id
-        if event_id and self._already_seen(event_id):
+        if event_id and self._seen_contains(event_id):
             return False
+        await self.on_frame(frame)
         if event_id:
             self._acks.offer(event_id, frame.type)
-        await self.on_frame(frame)
+            self._mark_seen(event_id)
         return True
 
     def ack(self, event_id: str | None) -> None:
@@ -349,6 +384,15 @@ class StreamConsumer:
                         await self._emit(frame, stop)
                 # Server closed the stream cleanly. Reconnect to keep watching.
                 log.debug("stream %s closed by server; reconnecting", self.session_id)
+                # A clean close that did NOT stay up long enough to see a heartbeat is
+                # indistinguishable from a proxy that accepts the stream and immediately EOFs
+                # (200 then close — no exception, so none of the handlers below fire). Counting
+                # it as a failure is what makes the backoff escalate. Without this, ``attempt``
+                # stayed at 0 and the delay was pinned at 1.0s forever — the exact battery and
+                # quota drain STABLE_STREAM_S and the comment at the backoff calculation exist
+                # to prevent.
+                if time.monotonic() - connected_at < STABLE_STREAM_S:
+                    attempt += 1
 
             except NotFound as exc:
                 # Stale or unknown cursor. Rebuild from history, which also repairs the
@@ -385,7 +429,8 @@ class StreamConsumer:
             except asyncio.CancelledError:
                 raise
 
-            except (httpx.ReadTimeout, httpx.HTTPError) as exc:
+            except httpx.HTTPError as exc:
+                # ReadTimeout is a subclass of HTTPError, so naming both was redundant.
                 attempt += 1
                 log.info("stream %s dropped (%s: %s)", self.session_id, type(exc).__name__, exc)
 

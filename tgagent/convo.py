@@ -68,6 +68,7 @@ class Conversation:
         stream_slots: asyncio.Semaphore,
         on_fatal=None,
         on_gone=None,
+        on_ended=None,
     ):
         self.db = db
         self.api = api
@@ -77,6 +78,7 @@ class Conversation:
         self.stream_slots = stream_slots
         self.on_fatal = on_fatal
         self.on_gone = on_gone
+        self.on_ended = on_ended
 
         self.convo_id: int = row["convo_id"]
         self.tg_user_id: int = row["tg_user_id"]
@@ -98,6 +100,9 @@ class Conversation:
         self._consumer: StreamConsumer | None = None
         # The poll fallback has no consumer to own the cursor, so it uses the same tracker.
         self._poll_acks = AckTracker(commit=self._set_cursor)
+        # rendered_events.seq position of the last cursor committed, for the monotonic guard in
+        # _set_cursor. None until the first commit that has a rendered position to compare.
+        self._cursor_seq: int | None = None
         # Strong references to tasks that retire this conversation. They are created on the
         # loop rather than awaited, because awaiting a shutdown from inside one of _tasks makes
         # that task cancel and await itself.
@@ -137,6 +142,10 @@ class Conversation:
             budget=chat_budget,
             convo_id=self.convo_id,
             chat_id=self.chat_id,
+            # Route artifact notices through the renderer so there is still exactly one writer to
+            # this chat. Sending them straight through the sink let an artifact notice interleave
+            # with a status edit the renderer was mid-way through.
+            notifier=self.renderer.post_notice,
         )
 
     # --- lifecycle ----------------------------------------------------------------
@@ -147,20 +156,37 @@ class Conversation:
             asyncio.create_task(self._consume_loop(), name=f"consume-{self.convo_id}"),
             asyncio.create_task(self._pump_loop(), name=f"pump-{self.convo_id}"),
         ]
-        # Anything left undelivered by a crash gets another attempt.
-        pending = await self.artifacts.retry_pending()
-        if pending:
-            log.info("convo %s retrying %d undelivered artifacts", self.convo_id, pending)
+        # Anything left undelivered by a crash gets another attempt. A failure here must NOT
+        # abort start(): the three tasks are already running, and letting it propagate left the
+        # conversation registered and live while the caller reported "could not start" — tasks
+        # nobody would ever shut down. Artifact retry is best-effort at startup.
+        try:
+            pending = await self.artifacts.retry_pending()
+            if pending:
+                log.info("convo %s retrying %d undelivered artifacts", self.convo_id, pending)
+        except Exception:  # noqa: BLE001 - startup artifact retry must not kill the conversation
+            log.exception("convo %s could not retry pending artifacts", self.convo_id)
         self.wake.set()
 
     async def shutdown(self) -> None:
         self.stop.set()
         self.wake.set()
+        # First, retire this conversation so no new detached task can be scheduled.
+        if not self.stop.is_set():
+            log.warning("shutdown without stop being set")
+        # Cancel existing tasks and await them. Detached tasks are separate from the main three;
+        # they're created by _schedule_detached to avoid a task awaiting its own shutdown from
+        # inside the event loop. We must still await them here or the HTTP client closes while
+        # one is in-flight.
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.renderer.wait_for_hooks(timeout=5.0)
         await self.renderer.force_flush()
+        # Await all detached tasks so _auto_resume cannot mint a replacement session after the
+        # process tears down and the HTTP client has already been closed.
+        if self._detached:
+            await asyncio.gather(*self._detached, return_exceptions=True)
 
     # --- durable cursor -----------------------------------------------------------
 
@@ -171,10 +197,50 @@ class Conversation:
         return row["last_event_id"] if row else None
 
     def _set_cursor(self, event_id: str | None) -> None:
+        """Advance the durable cursor, never backwards.
+
+        Two AckTrackers commit through here — the live consumer's and the poll fallback's — and
+        ``_record_rendered`` acknowledges BOTH on every write, because an event offered while
+        polling can be confirmed after a stream consumer has taken over. Across that handover the
+        laggard tracker can present an older event id after the leader already committed a newer
+        one. A backward jump is not data loss (the durable dedupe suppresses the re-delivery) but
+        it forces a full history re-walk on the next reconnect, which on a phone is real battery
+        and quota.
+
+        Ordering is taken from ``rendered_events.seq`` — the local monotonic order in which events
+        were actually rendered — rather than from the opaque ids, which are not guaranteed
+        comparable. A rewind is refused ONLY when both the committed cursor and the new id have a
+        rendered position and the new one is earlier; an id with no row (an ephemeral event acked
+        on sight, or a cold start) has nothing to compare and is always written, because refusing
+        it could freeze the cursor — strictly worse than a redundant re-walk.
+        """
+        if event_id is None:
+            self.db.execute(
+                "UPDATE conversations SET last_event_id = NULL WHERE convo_id = ?",
+                (self.convo_id,),
+            )
+            self._cursor_seq = None
+            return
+        new_seq = self._rendered_seq(event_id)
+        if new_seq is not None and self._cursor_seq is not None and new_seq < self._cursor_seq:
+            log.debug(
+                "convo %s ignoring a backward cursor commit %s (seq %d < %d)",
+                self.convo_id, event_id, new_seq, self._cursor_seq,
+            )
+            return
         self.db.execute(
             "UPDATE conversations SET last_event_id = ? WHERE convo_id = ?",
             (event_id, self.convo_id),
         )
+        if new_seq is not None:
+            self._cursor_seq = new_seq
+
+    def _rendered_seq(self, event_id: str) -> int | None:
+        row = self.db.query_one(
+            "SELECT seq FROM rendered_events WHERE convo_id = ? AND event_id = ?",
+            (self.convo_id, event_id),
+        )
+        return int(row["seq"]) if row else None
 
     def _set_status(self, status: str, stop_reason: dict | None = None) -> None:
         auth.update_conversation(
@@ -220,7 +286,6 @@ class Conversation:
         )
         self.wake.set()
 
-
     def send_text(self, text: str) -> None:
         self.enqueue("text", {"text": text})
 
@@ -229,29 +294,58 @@ class Conversation:
         self.renderer.post_notice(text, is_error=is_error)
 
     async def request_stop(self) -> bool:
-        """Cancel the running turn. The session stays reusable.
+        """Cancel the running turn AND drop anything still waiting to be sent.
 
-        One mechanism, not two. This used to enqueue an ``interrupt`` row for the pump to post
-        as a ``user.interrupt`` turn event *and* call ``POST /sessions/{id}/cancel`` directly,
-        so a single /stop produced both — the interrupt then fired against a session that was
-        already cancelling, and cost an extra round-trip to do it. ``/cancel`` is the documented
-        verb and reports the resulting status, so it is the one to use.
+        Cancelling the session alone was not enough: a message sitting in the debounce window or
+        queued behind the turn dispatched the moment the session went idle, so /stop appeared to
+        work and then the very message the user was trying to stop arrived anyway. Pending rows
+        are marked cancelled so the pump skips them.
 
-        The pump still knows how to retire an ``interrupt`` row, because one may already be
-        sitting in a database written before this change; without that branch ``_drain_queue``
-        would spin on a row nothing else consumes.
+        The session is only told to cancel — and the status only set to ``canceling`` — when a turn
+        is actually running. Against an idle session the cancel is a no-op, and claiming otherwise
+        left the conversation stuck in ``canceling`` with nothing to cancel while the user was told
+        "could not cancel that turn" about a message that then sent regardless.
+
+        One mechanism, not two: ``POST /sessions/{id}/cancel`` is the documented verb. The pump
+        still knows how to retire a legacy ``interrupt`` row, because one may sit in a database
+        written before this change.
         """
+        dropped = self._cancel_queued()
         if not self.session_id:
-            return False
+            if dropped:
+                self.notice(f"Dropped {dropped} message(s) that had not been sent yet.")
+            return dropped > 0
+
+        running = self.renderer.running
         try:
             await self.api.cancel_session(self.session_id)
         except QoderError as exc:
             log.warning("cancel failed for %s: %s", self.session_id, exc)
-            self.notice(f"Could not cancel that turn: {exc.message}", is_error=True)
-            return False
-        self._set_status("canceling")
-        self.notice("Cancelling the current turn…")
+            if not dropped:
+                self.notice(f"Could not cancel that turn: {exc.message}", is_error=True)
+            return dropped > 0
+
+        if running:
+            self._set_status("canceling")
+            self.notice("Cancelling the current turn…")
+        if dropped:
+            self.notice(f"Dropped {dropped} message(s) that had not been sent yet.")
         return True
+
+    def _cancel_queued(self) -> int:
+        """Mark every not-yet-sent inbound row cancelled, so the pump will not dispatch it.
+
+        Returns how many were dropped. ``cancelled`` is a terminal state distinct from ``sent``
+        and from :data:`config.RESUME_QUEUE_STATE`: both :meth:`_next_queued` and
+        ``history.take_queued_texts`` select on ``state = 'queued'``, so a cancelled row is
+        neither dispatched nor carried over to a rebuilt conversation.
+        """
+        cur = self.db.execute(
+            """UPDATE inbound_queue SET state = 'cancelled', sent_at = ?
+               WHERE convo_id = ? AND state = 'queued'""",
+            (utcnow(), self.convo_id),
+        )
+        return cur.rowcount
 
     # --- pump: the 409 serializer -------------------------------------------------
 
@@ -388,21 +482,10 @@ class Conversation:
                 self._give_up_on_credentials(message_is_queued=True)
                 return
             except BillingError as exc:
-                # Out of credits — do not retry forever and fill the log. The message is queued,
-                # so give up and mark it stopped. A restart will not help; credits must be added.
-                log.error(
-                    "pump for convo %s stopped: billing error (%s)",
-                    self.convo_id, exc.message,
-                )
-                self.notice(
-                    f"Credits exhausted: {exc.message}\n\n"
-                    "The conversation has stopped because you have no available credits.\n"
-                    "Please renew your plan or purchase a resource package to continue.\n"
-                    "You can start a new conversation anytime using /new.",
-                    is_error=True,
-                )
-                self.terminated = True
-                self._set_status("terminated")
+                # Out of credits — do not retry forever and fill the log. The message stays
+                # queued, so give up and mark it stopped. A restart will not help; credits must
+                # be added.
+                self._stop_for_billing(exc, "pump")
                 return
             except Exception:  # noqa: BLE001 - the pump must never die silently
                 # This task is the only thing that can post a turn, so letting an exception
@@ -427,9 +510,13 @@ class Conversation:
             if row is None:
                 break
             if row["kind"] == "interrupt":
-                self._mark_sent(int(row["id"]))
+                # Marked sent only AFTER the API call, matching the rule _dispatch_burst follows
+                # for text rows. Marking first meant a send_interrupt that raised left the row
+                # retired and the interrupt silently lost — the one place that violated this
+                # module's own "mark after the API accepts" invariant.
                 if self.session_id:
                     await self.api.send_interrupt(self.session_id)
+                self._mark_sent(int(row["id"]))
                 continue
             if not await self._idle_now():
                 break  # a turn is in flight; wait for status_idle
@@ -502,6 +589,7 @@ class Conversation:
             self._set_status("terminated")
             self.notice("That conversation has ended and can no longer accept messages. "
                         "Use /new to start another.", is_error=True)
+            self._wind_down(clear_active=True)
             return False
         self._note_actual_model(session)
         self._set_status(status or "idle")
@@ -585,23 +673,9 @@ class Conversation:
                 self._give_up_on_credentials()
                 return
             except BillingError as exc:
-                # Out of credits — the session cannot continue consuming events because
-                # nothing more will be generated until credits are added. Give up and tell
-                # the user clearly what happened. A restart will not help; credits must be
-                # added or a new conversation created after renewing.
-                log.error(
-                    "consumer for convo %s stopped: billing error (%s)",
-                    self.convo_id, exc.message,
-                )
-                self.terminated = True
-                self._set_status("terminated")
-                self.notice(
-                    f"Credits exhausted: {exc.message}\n\n"
-                    "The conversation has stopped because you have no available credits.\n"
-                    "Please renew your plan or purchase a resource package to continue.\n"
-                    "You can start a new conversation anytime using /new.",
-                    is_error=True,
-                )
+                # Out of credits — the session cannot generate anything more until credits are
+                # added, so there is nothing left to consume. A restart will not help.
+                self._stop_for_billing(exc, "consumer")
                 return
             except Exception:  # noqa: BLE001 - a consumer must never die silently
                 log.exception("consumer failed for convo %s", self.convo_id)
@@ -635,13 +709,49 @@ class Conversation:
             f"Fix the token in .env and restart the bot to resume. {detail}",
             is_error=True,
         )
+        # Recoverable, so active stays set: a restart re-adopts this same conversation. Retiring
+        # it here means a message before that restart re-adopts and re-reports the dead token
+        # instead of enqueueing into a pump that has already given up.
+        self._wind_down(clear_active=False)
+
+    def _stop_for_billing(self, exc: BillingError, source: str) -> None:
+        """Retire the conversation and say why, once, for any path that hits a 402.
+
+        The pump, the stream consumer and the poll fallback can each be the first to see an
+        exhausted credit balance, and all three must end in the same place: terminated locally,
+        with one notice. ``source`` only labels the log line.
+
+        Idempotent on ``terminated`` for the same reason :meth:`_give_up_on_credentials` guards
+        on ``credentials_rejected`` — two of the three paths can notice the same dead balance
+        within one tick, and the user should not be told twice.
+
+        Nothing is lost by stopping: the inbound queue is durable, so the message that could not
+        be paid for is still there after credits are added and the bot restarts.
+        """
+        log.error("%s for convo %s stopped: billing error (%s)", source, self.convo_id, exc.message)
+        if self.terminated:
+            return
+        self.terminated = True
+        self._set_status("terminated")
+        self.notice(
+            budget.exhausted_notice(
+                exc.message,
+                blocked="The conversation has stopped because you have no available credits.",
+                hint="You can start a new conversation anytime using /new.",
+            ),
+            is_error=True,
+        )
+        # Recoverable once credits are added, so active stays set and a restart re-adopts this
+        # same conversation. Retiring it now means a message before that re-adopts, re-hits the
+        # 402 and re-reports it, rather than enqueueing into a pump that has already stopped.
+        self._wind_down(clear_active=False)
 
     def _on_session_gone(self) -> None:
         """The cloud session no longer exists. Retire it as RESUMABLE and say so.
 
-        If the renderer is running, queue a notice for force-flush on shutdown. If it's not
-        running (tasks haven't started or already stopped), skip the notice: the rebuild
-        process will tell users what happened, and sending duplicates would be noise.
+        The notice is only queued when the renderer is running, so it survives into the
+        force-flush on shutdown. When it is not — tasks never started, or already stopped — the
+        rebuild tells the user instead, and a second message would be noise.
 
         Distinct from :meth:`_give_up_on_credentials`: a rejected PAT is not recoverable from
         inside the bot, whereas a vanished session is — the local transcript can rebuild the
@@ -654,9 +764,6 @@ class Conversation:
         self._set_status("terminated")
         auth.mark_conversation_lost(self.db, self.convo_id, self.tg_user_id)
 
-        # If the renderer is running, queue a notice for force-flush on shutdown. If it's not
-        # running (tasks haven't started or already stopped), skip the notice: the rebuild
-        # process will tell users what happened, and sending duplicates would be noise.
         if self.renderer.running:
             self.notice(
                 "That conversation's cloud session is gone, so it has been closed. Its history is "
@@ -664,9 +771,6 @@ class Conversation:
                 "⟳ RESTORE.",
                 is_error=True,
             )
-        else:
-            # Renderer not running means we're in auto-resume mode; no notice needed yet.
-            pass
 
         if self.on_gone:
             self._schedule_detached(self.on_gone(self))
@@ -782,19 +886,7 @@ class Conversation:
         except Unauthorized:
             raise  # the consume loop gives up on this; retrying every 5s cannot help
         except BillingError as exc:
-            log.error(
-                "poll for convo %s stopped: billing error (%s)",
-                self.convo_id, exc.message,
-            )
-            self.terminated = True
-            self._set_status("terminated")
-            self.notice(
-                f"Credits exhausted: {exc.message}\n\n"
-                "The conversation has stopped because you have no available credits.\n"
-                "Please renew your plan or purchase a resource package to continue.\n"
-                "You can start a new conversation anytime using /new.",
-                is_error=True,
-            )
+            self._stop_for_billing(exc, "poll")
             return
         except QoderError as exc:
             log.warning("poll failed for convo %s: %s", self.convo_id, exc)
@@ -830,6 +922,33 @@ class Conversation:
         task = loop.create_task(coro)
         self._detached.add(task)
         task.add_done_callback(self._detached.discard)
+
+    def _wind_down(self, *, clear_active: bool) -> None:
+        """Stop routing to this conversation and hand retirement to the manager.
+
+        The pump and consume loops exit on ``terminated``/``stop``, but the row stayed
+        ``active = 1`` and the object stayed in the manager's registry unless something cleared
+        them — so the next message still resolved to this corpse, enqueued into a pump that had
+        already exited, and was never drained or acknowledged. That silent black hole left a chat
+        wedged until the user happened to guess /new.
+
+        ``clear_active`` is set for a session that can never accept messages again (ended or
+        archived): the next message then opens a fresh conversation. It is left unset for billing
+        and credential failures, which are recoverable — keeping ``active = 1`` is what lets
+        reconcile re-adopt the SAME conversation on the next boot once credits or the token are
+        fixed, and retiring it here means a message in the meantime re-adopts and re-reports the
+        problem rather than vanishing into a dead queue.
+
+        Sets ``stop`` immediately so ``active_for`` and ``live_count`` skip this conversation at
+        once, then schedules the manager's retirement as a detached task: awaiting it from inside
+        one of our own tasks would be a task cancelling and awaiting itself.
+        """
+        if clear_active:
+            auth.update_conversation(self.db, self.convo_id, self.tg_user_id, active=0)
+        self.stop.set()
+        self.wake.set()
+        if self.on_ended:
+            self._schedule_detached(self.on_ended(self))
 
     # --- hooks --------------------------------------------------------------------
 
@@ -867,7 +986,7 @@ class Conversation:
             return
         user = auth.get_user(self.db, self.tg_user_id)
         if user:
-            warning = budget.check_budget(self.db, user, self.tg_user_id)
+            warning = budget.check_budget(self.db, user)
             if warning:
                 self.notice(warning)
 
@@ -876,9 +995,18 @@ class Conversation:
         self.wake.set()
 
     async def _on_terminated(self, payload: dict) -> None:
+        # Guarded: a session can emit more than one terminated-flavoured event, and without this
+        # each would post the notice again and schedule another retirement.
+        if self.terminated:
+            return
         self.terminated = True
         self._set_status("terminated")
-        self.wake.set()
+        # This renderer-hook path used to set the flag and say nothing — half of the black hole.
+        # The pump exits on ``terminated``, but the user got no word and their next message still
+        # routed here. Tell them, and stop routing to a session that can never accept messages.
+        self.notice("That conversation has ended and can no longer accept messages. "
+                    "Use /new to start another.", is_error=True)
+        self._wind_down(clear_active=True)
 
     # --- workspace staleness ------------------------------------------------------
 

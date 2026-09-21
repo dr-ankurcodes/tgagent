@@ -10,17 +10,19 @@ and retry provisioning on the next /new.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder
 
-from tgagent import handlers
+from tgagent import handlers, runtime
+from tgagent.auth import AccessControl
 from tgagent.config import load_settings
 from tgagent.db import Database
 from tgagent.manager import Manager
-from tgagent.qclient import QoderClient, QoderError
+from tgagent.qclient import QoderError
 from tgagent.qsessions import QoderAPI
 
 log = logging.getLogger("tgagent")
@@ -42,22 +44,33 @@ def configure_logging(level: str) -> None:
 async def post_init(app: Application) -> None:
     settings = app.bot_data["settings"]
     db = Database(settings.db_path)
-    client = QoderClient(settings.qoder_api_base, settings.qoder_pat)
-    api = QoderAPI(client, db)
-    manager = Manager(db=db, api=api, settings=settings, bot=app.bot)
 
-    app.bot_data.update(db=db, api=api, manager=manager, startup_error=None)
+    # A PAT rotated from Telegram (persisted to kv) overrides the environment bootstrap value.
+    settings = runtime.resolve_pat(db, settings)
+    app.bot_data["settings"] = settings
+
+    # Runtime access control: the admin id is fixed from env, the allowlist is DB-backed and
+    # mutable from Telegram. Seeded from settings.allowed_ids on first run.
+    access = AccessControl(db, admin_id=settings.admin_id, seed_allowed=settings.allowed_ids)
+
+    api, manager = await runtime.build_backend(app, settings, db)
+    app.bot_data.update(
+        db=db, access=access, api=api, manager=manager,
+        swap_lock=asyncio.Lock(), startup_error=None,
+    )
 
     me = await app.bot.get_me()
     log.info("connected to telegram as @%s (id %s)", me.username, me.id)
 
-    if settings.allowlist_open:
+    if access.admin_id is not None:
+        log.info("administrator: user id %s", access.admin_id)
+    if access.discovery_mode:
         log.warning(
-            "TG_ALLOWED_IDS is empty: nobody can use the bot yet. Send it a message to "
-            "discover your user id, then add it to .env and restart."
+            "allowlist is empty: only the administrator can use the bot. Send it a message to "
+            "discover a user id, then add it with /allow (or TG_ALLOWED_IDS in .env)."
         )
     else:
-        log.info("allowlist: %d user(s)", len(settings.allowed_ids))
+        log.info("allowlist: %d user(s)", len(access.snapshot()))
 
     try:
         await manager.startup()

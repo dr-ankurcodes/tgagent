@@ -47,6 +47,15 @@ class Manager:
         self._resume_attempts: dict[tuple[int, int | None], int] = {}
         # One lock per chat, so concurrent updates cannot both provision a session for it.
         self._provision_locks: dict[tuple[int, int | None], asyncio.Lock] = {}
+        # One lock per conversation id, so retire() and _adopt() for the same conversation cannot
+        # interleave. retire() pops the conversation and then awaits a shutdown that takes seconds
+        # (cancelling tasks, waiting for hooks, force-flushing); without this a concurrent
+        # active_for/switch_to saw the empty slot mid-retirement and adopted a SECOND live
+        # conversation for the same row — two renderers writing one chat at once.
+        self._lifecycle_locks: dict[int, asyncio.Lock] = {}
+        # Set during shutdown so a detached retirement task cannot mint a replacement session
+        # (auto_resume) while the process is tearing down and the HTTP client is about to close.
+        self._shutting_down = False
 
     def _lock_for(self, chat_id: int, message_thread_id: int | None) -> asyncio.Lock:
         """The provisioning lock for one chat (and topic, in a forum supergroup).
@@ -59,8 +68,22 @@ class Manager:
         key = (chat_id, message_thread_id)
         lock = self._provision_locks.get(key)
         if lock is None:
+            # Bound the registry: keys are chosen by whoever messages the bot, so without this it
+            # grew with every chat ever seen. Only UNLOCKED entries are dropped — discarding a held
+            # lock would let a second caller into the critical section it exists to own.
+            if len(self._provision_locks) > 256:
+                for stale in [k for k, v in self._provision_locks.items() if not v.locked()]:
+                    self._provision_locks.pop(stale, None)
             lock = asyncio.Lock()
             self._provision_locks[key] = lock
+        return lock
+
+    def _lifecycle_lock(self, convo_id: int) -> asyncio.Lock:
+        """The retire/adopt lock for one conversation, so the two cannot interleave."""
+        lock = self._lifecycle_locks.get(convo_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._lifecycle_locks[convo_id] = lock
         return lock
 
     async def _notify_chat(self, convo: Conversation, text: str, *, is_error: bool = True) -> None:
@@ -184,13 +207,22 @@ class Manager:
             return False
 
     async def _adopt(self, row: sqlite3.Row) -> Conversation | None:
-        if row["convo_id"] in self._convos:
-            return self._convos[row["convo_id"]]
-        convo = self._build(row)
-        self._convos[row["convo_id"]] = convo
-        await convo.start()
-        convo.warn_if_workspace_reclaimed()
-        return convo
+        """Build and start a conversation, protecting against retire-then-replace."""
+        convo_id = row["convo_id"]
+        lock = self._lifecycle_lock(convo_id)
+        async with lock:
+            if convo_id in self._convos:
+                return self._convos[convo_id]
+            convo = self._build(row)
+            self._convos[convo_id] = convo
+            try:
+                await convo.start()
+                convo.warn_if_workspace_reclaimed()
+            except Exception:  # noqa: BLE001 - the lock already held prevents a race
+                log.exception("could not start conversation %s", convo_id)
+                self._convos.pop(convo_id, None)
+                raise
+            return convo
 
     def _build(self, row: sqlite3.Row) -> Conversation:
         sink = TelegramSink(self.bot, message_thread_id=row["message_thread_id"])
@@ -204,6 +236,7 @@ class Manager:
             stream_slots=self.stream_slots,
             on_fatal=self._on_fatal,
             on_gone=self._on_gone,
+            on_ended=self._on_ended,
         )
 
     async def _on_fatal(self, convo: Conversation) -> None:
@@ -235,34 +268,74 @@ class Manager:
         log.info("session for conversation %s is gone; releasing its tasks", convo.convo_id)
         queued = history.take_queued_texts(self.db, convo.convo_id)
         await self.retire(convo.convo_id)
+        if self._shutting_down:
+            # Do not mint a replacement session during teardown. The queued texts are durable and
+            # the conversation is already marked lost, so the next boot reconciles it and /sessions
+            # still offers ⟳ RESTORE. Rebuilding now would race the HTTP client that post_shutdown
+            # closes the moment Manager.shutdown returns.
+            return
         await self._auto_resume(convo, queued)
+
+    async def _on_ended(self, convo: Conversation) -> None:
+        """The cloud session ended or was archived; nothing is resumable.
+
+        Retire it so it stops holding three tasks and a stream slot. Unlike :meth:`_on_gone` there
+        is no rebuild — an ended session cannot accept messages again — and the conversation's
+        ``active`` flag was already cleared on the conversation side, so the user's next message
+        opens a fresh conversation instead of enqueueing into a pump that has already exited.
+        """
+        log.info("session for conversation %s ended; retiring it", convo.convo_id)
+        await self.retire(convo.convo_id)
 
     async def _auto_resume(self, convo: Conversation, queued: list[str]) -> None:
         """Rebuild a lost conversation without being asked, carrying over what was pending.
 
-        Bounded by ``AUTO_RESUME_MAX_ATTEMPTS`` per chat. A session that vanishes again
-        immediately after being created is not something another rebuild will fix, and an
-        unbounded rebuild loop would mint a paid session every few seconds.
+        Bounded by ``AUTO_RESUME_MAX_ATTEMPTS`` CONSECUTIVE failures per chat. A session that
+        vanishes again immediately after being created is not something another rebuild will
+        fix, and an unbounded rebuild loop would mint a paid session every few seconds.
+
+        The counter is cleared on success, so it measures a run of failures rather than the
+        chat's whole life: without that, three losses spread across a month — each recovered
+        cleanly — would disable automatic recovery until the process happened to restart, and
+        the fourth loss would leave the user with a dead chat and no explanation.
+
+        Crucially, the counter is NOT incremented on transient failures: a message arriving while
+        rebuilding, or the user tapping ⟳ RESTORE mid-flight, are both normal and should not
+        poison the retry logic for a genuinely broken session. Only a hard error that actually
+        prevents a rebuild counts towards the ceiling.
         """
         key = (convo.chat_id, convo.thread_id)
         attempts = self._resume_attempts.get(key, 0)
         if attempts >= config.AUTO_RESUME_MAX_ATTEMPTS:
             log.error(
-                "conversation %s lost its session and rebuilding has already been tried %d "
-                "time(s) in this chat; not trying again until the bot restarts. The transcript "
-                "is safe on disk and /sessions still offers ⟳ RESTORE.",
+                "conversation %s lost its session and rebuilding has already failed %d "
+                "time(s) in a row in this chat; not trying again until the bot restarts. The "
+                "transcript is safe on disk and /sessions still offers ⟳ RESTORE.",
                 convo.convo_id, attempts,
             )
             await self._notify_chat(convo, "That conversation could not be rebuilt automatically. Use /sessions and tap ⟳ RESTORE to try again, or /new to start fresh.")
             return
-        self._resume_attempts[key] = attempts + 1
 
+        # Do NOT increment before attempting: a None result means nothing resuming exists
+        # (the user already tapped ⟳ RESTORE), and returning early without popping would leave
+        # the counter incremented forever. We also don't count transient failures (QoderError):
+        # a message arriving mid-rebuild can cause this error, and counting it would poison
+        # the counter on the next normal message. Only a real blockage that prevents resume
+        # (None or BillingError) should contribute to the limit.
         try:
             resumed = await self.resume_lost_conversation(
                 tg_user_id=convo.tg_user_id,
                 chat_id=convo.chat_id,
                 message_thread_id=convo.thread_id,
             )
+        except BillingError as exc:
+            # This is a real blockage: no credits to rebuild with. Count it and bail.
+            self._resume_attempts[key] = attempts + 1
+            if self._resume_attempts[key] > config.AUTO_RESUME_MAX_ATTEMPTS:
+                await self._notify_chat(convo, "Could not rebuild that conversation: no available credit to restore it. Please renew your plan or add credits, then use /sessions and tap ⟳ RESTORE, or /new to start fresh.")
+            else:
+                await self._notify_chat(convo, f"Could not rebuild that conversation: {exc.message}. Please renew your plan or add credits, then use /sessions and tap ⟳ RESTORE to try again.")
+            return
         except QoderError as exc:
             # Not fatal: the user's next message reaches the same path through the handler,
             # where the failure can be reported to them directly. But tell them now so there's
@@ -270,8 +343,14 @@ class Manager:
             log.warning("could not rebuild conversation %s: %s", convo.convo_id, exc.message)
             await self._notify_chat(convo, f"Could not rebuild that conversation: {exc.message}. Send your message again and I will retry; or use /sessions and tap ⟳ RESTORE to try again.")
             return
+
         if resumed is None:
+            # Nothing resuming existed — likely the user already tapped ⟳ RESTOIRE somewhere else.
+            # Do not count this against the limit; the user explicitly intervened.
             return
+
+        # This rebuild worked, so the next loss starts counting from zero again.
+        self._resume_attempts.pop(key, None)
 
         new_convo, transcript = resumed
         # Hold the transcript durably instead of enqueueing it: it goes out as part of the turn
@@ -279,13 +358,13 @@ class Manager:
         # nest the previous resume's history inside this one and then that one inside the next,
         # growing exponentially every time the session was lost.
         history.set_resume_context(self.db, new_convo.convo_id, transcript)
-        
+
         # Queue the carried-over messages only; _dispatch_burst will prepend pending_transcript
         # once before sending them. If there were none, the transcript sits there waiting for
         # the user's next message — no billable round-trip just to say "Welcome back!".
         for text in queued:
             new_convo.send_text(text)
-        
+
         if queued:
             new_convo.notice(
                 "Your previous conversation has been restored. The cloud session was lost "
@@ -351,9 +430,7 @@ class Manager:
 
         # The session takes its model, system prompt and tool permissions from its agent, and
         # the API offers no per-session override. So the model choice only becomes real here.
-        log.info("_provision_session: user=%s model_id=%r", tg_user_id, model_id)
         agent_id = await self.agent_for(tg_user_id, model_id)
-        log.info("agent_id for user %s: %s", tg_user_id, agent_id)
 
         resources: list[dict] = []
         user = auth.get_user(self.db, tg_user_id)
@@ -439,6 +516,11 @@ class Manager:
             env_id=self.env_id,
             model_id=model_id,
         )
+        # H3: live conversations are never retired on switch/new — unbounded task & socket growth.
+        # Before minting a new session, retire any other conversation in this chat that's still
+        # running its tasks but won't receive messages anymore — the user is starting fresh here.
+        await self._retire_superseded(tg_user_id, chat_id, message_thread_id)
+
         row = auth.get_conversation(self.db, convo_id, tg_user_id)
         convo = self._build(row)
         self._convos[convo_id] = convo
@@ -446,6 +528,32 @@ class Manager:
         log.info("created conversation %s (session %s, agent %s, model %s) for user %s",
                  convo_id, session["id"], agent_id, model_id, tg_user_id)
         return convo
+
+    async def _retire_superseded(
+        self,
+        tg_user_id: int,
+        chat_id: int,
+        message_thread_id: int | None,
+    ) -> int:
+        """Retire every active conversation in this chat except the one we're about to adopt.
+
+        ``_lock_for`` owns the critical section for provisioning; entering it serialises with
+        other concurrent creates/switches. Without this step, the existing conversation stayed
+        in `_convos` with all three tasks running, draining stream slots even though no message
+        would ever go to it again — the exact battery/socket drain that keeps conversations
+        alive while the user moves to a new one. Returns how many were retired.
+        """
+        retired = 0
+        for cid, convo in list(self._convos.items()):
+            if (
+                convo.tg_user_id == tg_user_id
+                and convo.chat_id == chat_id
+                and convo.thread_id == message_thread_id
+                and not convo.stop.is_set()
+            ):
+                await self.retire(cid)
+                retired += 1
+        return retired
 
     async def resume_lost_conversation(
         self,
@@ -482,20 +590,12 @@ class Manager:
                 return None
 
             old_convo_id = int(row["convo_id"])
-            log.info(
-                "resumable_conversation found: convo_id=%s, model_id=%r, title=%r",
-                old_convo_id, row["model_id"], row["title"]
-            )
             transcript = history.build_transcript(self.db, old_convo_id, title=row["title"])
             retained = history.available_local_files(self.db, old_convo_id)
 
             user = auth.ensure_user(self.db, self.settings, tg_user_id, handle)
             user_model_id = user["model_id"] if user else None
             model_id = row["model_id"] or user_model_id or self.settings.default_model
-            log.info(
-                "Using model_id=%r for resume (from row=%r, user=%r, default=%r)",
-                model_id, row["model_id"], user_model_id, self.settings.default_model
-            )
 
             # Through the shared helper, so a rebuilt session carries the user's memory store
             # exactly as a freshly created one does.
@@ -612,10 +712,30 @@ class Manager:
 
     async def retire(self, convo_id: int) -> None:
         """Retire a conversation: shut down its tasks and remove it from the active set."""
-        convo = self._convos.pop(convo_id, None)
-        if convo:
-            await convo.shutdown()
-            log.info("retired conversation %s", convo_id)
+        # Lifecycle lock: retire() pops from _convos then awaits shutdown() (seconds-long work);
+        # without this guard a concurrent active_for or switch_to saw the empty slot mid-retirement
+        # and adopted a SECOND live Conversation for the same row — two renderers writing one chat
+        # at once, breaking the single-writer invariant every other path obeys.
+        lock = self._lifecycle_lock(convo_id)
+        async with lock:
+            convo = self._convos.pop(convo_id, None)
+            if convo:
+                await convo.shutdown()
+                log.info("retired conversation %s", convo_id)
+
+        # Prune the per-chat provision locks to keep the registry bounded. Only unlocked entries
+        # are dropped — discarding a held lock would let a second caller into the critical section
+        # it exists to own. A 256-entry ceiling is high enough for any realistic deployment and
+        # low enough that the worst-case memory leak is negligible even when the process runs for
+        # weeks on an always-on phone.
+        stale = [k for k, v in self._provision_locks.items() if not v.locked()]
+        if len(stale) + len(self._provision_locks) > 256:
+            for key in stale[:len(stale)//2]:
+                self._provision_locks.pop(key, None)
+
+        # Prune the lifecycle locks we just released; they can grow unbounded if conversations
+        # are archived/forgotten in quick succession and the garbage collector doesn't notice.
+        self._lifecycle_locks.pop(convo_id, None)
 
     async def forget_chat(self, chat_id: int) -> int:
         """Retire every live conversation bound to a chat id. Returns how many were retired.

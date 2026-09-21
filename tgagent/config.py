@@ -65,6 +65,18 @@ TOOL_SPOILER_MIN_CHARS = 40
 # --- Handlers -----------------------------------------------------------------------
 ID_REMINDER_S = 3600  # /start echoes the caller's own user id at most this often
 
+# A non-allowed user is told why — and their rejection logged — at most this often. Without a
+# throttle, anyone who finds the bot makes it issue one Telegram sendMessage per message they
+# send: that burns the bot's global send budget, and Telegram flood-bans a bot that sustains it,
+# taking it offline for its real users as well. One reply a minute still answers everyone who
+# genuinely needs their id, while making a flood cost the sender far more than it costs us.
+REJECT_REPLY_INTERVAL_S = 60
+
+# Ceiling on how many non-allowed users the throttle remembers. Its keys are chosen by whoever
+# messages the bot, so an unbounded dict would itself be the denial of service it exists to
+# prevent — see handlers._RejectThrottle.
+REJECT_TRACKED_MAX = 1000
+
 
 # --- Concurrency -------------------------------------------------------------------
 # Each live conversation holds one open SSE connection, and a conversation beyond the cap
@@ -230,6 +242,13 @@ class Settings:
     qoder_api_base: str
     tg_bot_token: str
     allowed_ids: frozenset[int]
+    # The single administrator, fixed at deploy time from TG_ADMIN_ID. This is the root of
+    # trust: it is deliberately NOT changeable at runtime, so a compromised chat session cannot
+    # hand someone else the keys. ``allowed_ids`` and ``qoder_pat`` are only the SEED values —
+    # both are overridden at runtime from the database (see auth.AccessControl and the
+    # ``qoder_pat`` kv key), so the administrator can manage access and rotate the token from
+    # Telegram without a restart. The admin is always allowed, whether or not they are listed.
+    admin_id: int | None = None
     db_path: Path | None = None
     max_live_streams: int = DEFAULT_MAX_LIVE_STREAMS
     credit_budget: float = DEFAULT_CREDIT_BUDGET
@@ -239,8 +258,13 @@ class Settings:
     log_level: str = "INFO"
 
     @property
-    def allowlist_open(self) -> bool:
-        """An empty allowlist means discovery mode: admit nobody, but log who knocks."""
+    def discovery_mode(self) -> bool:
+        """An empty allowlist means discovery mode: admit nobody, but log who knocks.
+
+        The administrator (``admin_id``) is the exception — see auth.AccessControl.is_allowed —
+        so a deployment that sets TG_ADMIN_ID but leaves TG_ALLOWED_IDS empty is still usable by
+        the admin, who can then populate the allowlist from Telegram with /allow.
+        """
         return not self.allowed_ids
 
 
@@ -256,10 +280,34 @@ def _parse_ids(raw: str) -> frozenset[int]:
         if not part:
             continue
         try:
-            ids.add(int(part))
+            uid = int(part)
         except ValueError:
             raise ValueError(f"TG_ALLOWED_IDS entry {part!r} is not an integer") from None
+        if uid <= 0:
+            raise ValueError(
+                f"TG_ALLOWED_IDS entry {part!r} is not a positive Telegram user id"
+            )
+        ids.add(uid)
     return frozenset(ids)
+
+
+def _parse_admin_id(raw: str) -> int | None:
+    """Parse TG_ADMIN_ID: blank means no administrator, anything else must be a positive int.
+
+    A malformed value is a startup error rather than a silent None, matching how the rest of the
+    config is validated: an operator who typo'd their admin id should see it at boot, not discover
+    it later when /allow refuses them and they cannot work out why.
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        uid = int(raw)
+    except ValueError:
+        raise ValueError(f"TG_ADMIN_ID {raw!r} is not an integer") from None
+    if uid <= 0:
+        raise ValueError(f"TG_ADMIN_ID {raw!r} is not a positive Telegram user id")
+    return uid
 
 
 def _parse_env_value(raw: str) -> str:
@@ -267,10 +315,16 @@ def _parse_env_value(raw: str) -> str:
 
     Without this, ``QODER_PAT="abc"`` is used with the quotes still attached and every
     request 401s with no hint why. Quoting is also how you keep a literal ``#``.
+
+    A quoted value may carry a trailing comment (``KEY="abc" # note``): the closing quote is
+    found first and anything after it is discarded, so the quotes cannot survive into the value.
+    An unterminated quote yields the rest of the string rather than a guess at where it ended.
     """
     value = raw.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        return value[1:-1]
+    if value and value[0] in "\"'":
+        quote = value[0]
+        end = value.find(quote, 1)
+        return value[1:end] if end != -1 else value[1:]
     # Require the space before '#' so a value containing '#' unquoted still survives.
     return value.split(" #", 1)[0].strip()
 
@@ -290,6 +344,53 @@ def _parse_effort(raw: str) -> str | None:
             f"TGAGENT_EFFORT {raw!r} is not a reasoning effort level "
             f"(expected one of: {', '.join(EFFORT_LEVELS)})"
         )
+    return value
+
+
+def _env(name: str, default: str) -> str:
+    """``os.environ.get``, except that an EMPTY value falls back to ``default`` too.
+
+    .env lines are copied into the environment with ``setdefault``, so a key written with
+    nothing after its ``=`` records an empty string — and ``os.environ.get(name, default)``
+    then returns that empty string rather than the default, because the key IS present. For
+    every variable resolved through this helper an empty string is meaningless, and several are
+    actively breaking: ``Path("")`` is ``"."``, ``int("")`` raises ValueError at startup, and an
+    empty API base makes httpx build a relative URL that cannot resolve.
+
+    Leaving a documented key blank is the easiest mistake to make when copying .env.example, so
+    it is treated as "not set" rather than as a value. TG_ALLOWED_IDS and TGAGENT_EFFORT do NOT
+    go through here: for those two, empty is the meaningful setting.
+    """
+    return os.environ.get(name, "").strip() or default
+
+
+def _int_env(name: str, default: int, *, minimum: int | None = None) -> int:
+    """``_env`` parsed as an int, with a named error and an optional lower bound.
+
+    A bare ``int()`` failure names neither the variable nor the offending value, which on a
+    phone with no terminal is a startup error you cannot diagnose. Bounds matter too: a
+    negative ``BURST_DEBOUNCE_S`` or ``CREDIT_BUDGET`` is accepted silently by ``int``/``float``
+    and then does something nobody intended downstream.
+    """
+    raw = _env(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name}={raw!r} is not an integer") from None
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name}={value} must be >= {minimum}")
+    return value
+
+
+def _float_env(name: str, default: float, *, minimum: float | None = None) -> float:
+    """``_env`` parsed as a float, with a named error and an optional lower bound."""
+    raw = _env(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name}={raw!r} is not a number") from None
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name}={value} must be >= {minimum}")
     return value
 
 
@@ -313,16 +414,17 @@ def load_settings(env_path: Path | None = None) -> Settings:
 
     return Settings(
         qoder_pat=pat,
-        qoder_api_base=os.environ.get("QODER_API_BASE", "https://api.qoder.com").strip().rstrip("/"),
+        qoder_api_base=_env("QODER_API_BASE", "https://api.qoder.com").rstrip("/"),
         tg_bot_token=token,
         allowed_ids=_parse_ids(os.environ.get("TG_ALLOWED_IDS", "")),
-        db_path=Path(os.environ.get("TGAGENT_DB", str(ROOT / "tgagent.db"))),
-        max_live_streams=int(os.environ.get("MAX_LIVE_STREAMS", DEFAULT_MAX_LIVE_STREAMS)),
-        credit_budget=float(os.environ.get("CREDIT_BUDGET", DEFAULT_CREDIT_BUDGET)),
-        default_model=os.environ.get("TGAGENT_MODEL", DEFAULT_MODEL).strip(),
+        admin_id=_parse_admin_id(os.environ.get("TG_ADMIN_ID", "")),
+        db_path=Path(_env("TGAGENT_DB", str(ROOT / "tgagent.db"))),
+        max_live_streams=_int_env("MAX_LIVE_STREAMS", DEFAULT_MAX_LIVE_STREAMS, minimum=0),
+        credit_budget=_float_env("CREDIT_BUDGET", DEFAULT_CREDIT_BUDGET, minimum=0.0),
+        default_model=_env("TGAGENT_MODEL", DEFAULT_MODEL),
         default_effort=_parse_effort(os.environ.get("TGAGENT_EFFORT", "")),
-        burst_debounce_s=float(os.environ.get("BURST_DEBOUNCE_S", DEFAULT_BURST_DEBOUNCE_S)),
-        log_level=os.environ.get("TGAGENT_LOG", "INFO").strip().upper(),
+        burst_debounce_s=_float_env("BURST_DEBOUNCE_S", DEFAULT_BURST_DEBOUNCE_S, minimum=0.0),
+        log_level=_env("TGAGENT_LOG", "INFO").upper(),
     )
 
 
@@ -340,7 +442,46 @@ def restrict(path: Path, mode: int) -> None:
     try:
         path.chmod(mode)
     except OSError as exc:
-        log.debug("could not set %o on %s: %s", mode, path, exc)
+        # WARNING, not DEBUG: a chmod failure on the transcript database or file cache means
+        # conversation content stayed world-readable, and at the default INFO log level a DEBUG
+        # line is invisible. The bot still starts — a filesystem that refuses chmod must not be
+        # fatal — but the operator has to be able to see that it happened.
+        log.warning("could not set %o on %s: %s", mode, path, exc)
+
+
+def safe_path_component(value: str, fallback: str = "file") -> str:
+    """One filesystem-safe path component from an untrusted name or id.
+
+    Filenames reach us from a Telegram upload or an agent-chosen artifact name, and file ids
+    from the API. Either could carry a separator that escapes the directory it is joined onto,
+    so every such value is reduced to its basename before it touches a path.
+
+    ``".."`` is rejected explicitly rather than relying on ``Path.name``: ``Path("..").name`` is
+    ``".."``, so a caller that does ``root / safe_path_component(x)`` without an additional
+    prefix would get parent-directory escape. Both current call sites embed the result in a
+    prefixed filename, but the guard belongs here so a future caller cannot reintroduce the hole.
+    """
+    name = Path(str(value)).name.strip()
+    if not name or name == "..":
+        return fallback
+    return name
+
+
+def _ensure_private_dir(base: Path) -> Path:
+    """Create ``base`` if needed and tighten it to 0700, refusing to follow a symlink.
+
+    ``mkdir(exist_ok=True)`` succeeds on a pre-planted symlink-to-dir, and the subsequent
+    ``chmod`` then lands on the symlink TARGET rather than the link — in world-writable /tmp an
+    attacker could point ``tgagent`` at a directory they do not own and have us chmod it, or at
+    one they do own and read everything we write. Checking ``is_symlink`` first closes the
+    obvious window; a TOCTOU race between the check and the mkdir is inherent to any
+    create-if-missing pattern and is not worth the complexity of O_NOFOLLOW gymnastics here.
+    """
+    if base.is_symlink():
+        raise RuntimeError(f"{base} is a symlink; refusing to use it as a private directory")
+    base.mkdir(parents=True, exist_ok=True)
+    restrict(base, 0o700)
+    return base
 
 
 def tmp_root() -> Path:
@@ -349,10 +490,7 @@ def tmp_root() -> Path:
     Private because /tmp is world-writable: an artifact left here between download and
     delivery is otherwise readable by every other local account.
     """
-    base = Path(os.environ.get("TMPDIR", "/tmp")) / "tgagent"
-    base.mkdir(parents=True, exist_ok=True)
-    restrict(base, 0o700)
-    return base
+    return _ensure_private_dir(Path(os.environ.get("TMPDIR", "/tmp")) / "tgagent")
 
 
 def file_cache_root() -> Path:
@@ -364,8 +502,6 @@ def file_cache_root() -> Path:
     """
     override = os.environ.get("TGAGENT_FILECACHE")
     base = Path(override) if override else ROOT / FILE_CACHE_DIRNAME
-    base.mkdir(parents=True, exist_ok=True)
     # Re-applied on every call, so a cache directory an older build created world-readable is
     # tightened the next time anything is retained.
-    restrict(base, 0o700)
-    return base
+    return _ensure_private_dir(base)

@@ -137,6 +137,23 @@ async def ingest(
         log.warning("telegram download failed for %s: %s", filename, exc)
         raise IngestError(f"Telegram would not give me that file ({type(exc).__name__}).") from exc
 
+    # The two checks above trust Telegram's reported file_size, which can be missing (None -> 0)
+    # or simply wrong, and download_as_bytearray itself is uncapped. The real bytes are the only
+    # trustworthy bound, so re-check them: a missing size sailed past both pre-checks entirely,
+    # and an oversized file would otherwise reach the Qoder upload and fail there with a less
+    # useful error after the whole download had already been paid for in memory.
+    actual = len(contents)
+    if actual > config.TG_DOWNLOAD_MAX_BYTES:
+        raise IngestError(
+            f"that file turned out to be {actual // (1024 * 1024)} MB. Telegram only lets a bot "
+            "download up to 20 MB."
+        )
+    if actual > config.QODER_UPLOAD_MAX_BYTES:
+        raise IngestError(
+            f"that file is {actual / (1024 * 1024):.1f} MB. The Qoder upload endpoint accepts "
+            "about 5 MB. Try splitting it, or send the important part as text."
+        )
+
     metadata = {"convo_id": convo_id, "tg_user_id": tg_user_id, "source": "telegram"}
     try:
         uploaded = await api.upload(bytes(contents), filename, metadata=metadata)

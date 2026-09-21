@@ -19,7 +19,7 @@ from telegram import Bot
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 
-from .renderer import ChatGone, FloodWait, MessageGone, ParseRejected
+from .renderer import ChatGone, FloodWait, MessageGone, MessageTooLong, ParseRejected
 
 log = logging.getLogger("tgagent.telegram")
 
@@ -29,6 +29,15 @@ PARSE_MARKERS = (
     "parse entities",
     "unsupported parse_mode",
     "can't find end of the tag",
+)
+# Telegram rejects an over-cap message WHOLE rather than truncating it. Left unmapped, the raw
+# BadRequest escaped the renderer's four handled outcomes into its generic recovery path, which
+# retains buffered content by design — so the identical over-cap send was retried forever and the
+# conversation wedged. Mapping it lets the renderer fall back to a truncated plain-text send.
+TOO_LONG_MARKERS = (
+    "message is too long",
+    "text is too long",
+    "caption is too long",
 )
 GONE_MARKERS = (
     "message to edit not found",
@@ -61,10 +70,19 @@ def translate(exc: TelegramError) -> Exception:
             return _NotModified()
         if any(marker in message for marker in PARSE_MARKERS):
             return ParseRejected(str(exc))
+        if any(marker in message for marker in TOO_LONG_MARKERS):
+            return MessageTooLong(str(exc))
         if any(marker in message for marker in CHAT_GONE_MARKERS):
             return ChatGone(str(exc))
         if any(marker in message for marker in GONE_MARKERS):
             return MessageGone(str(exc))
+        # An unrecognised BadRequest is classified by English substrings above, so a wording
+        # change on Telegram's side lands here. Log the exact text before passing it through:
+        # without this the only trace was the renderer's generic "unexpected error in render
+        # loop", which named neither the cause nor the message, making a new marker invisible
+        # until a chat wedged. It is still returned raw rather than mapped to a content-dropping
+        # outcome — an unknown rejection must not silently eat buffered text.
+        log.warning("unclassified BadRequest passed through to the renderer: %s", exc)
         return exc
 
     # NetworkError, TimedOut and anything unrecognised are transient: let them propagate so

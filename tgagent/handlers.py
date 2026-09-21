@@ -21,10 +21,12 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from . import auth, budget, config, history, tg_html, uploads
+from . import auth, budget, config, history, runtime, tg_html, uploads
+from .auth import AccessControl
 from .convo import describe_row
+from .db import Database
 from .manager import Manager, model_choices_text
-from .qclient import BillingError, QoderError
+from .qclient import BillingError, QoderError, Unauthorized
 from .qsessions import conversation_title
 from .uploads import IngestError
 
@@ -112,33 +114,138 @@ def _manager(context: ContextTypes.DEFAULT_TYPE) -> Manager | None:
     return context.application.bot_data.get("manager")
 
 
-async def _reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Return True if this update should be ignored."""
-    user = update.effective_user
-    settings = context.application.bot_data["settings"]
+def _access(context: ContextTypes.DEFAULT_TYPE) -> AccessControl:
+    """The runtime access authority. Always present once post_init has run."""
+    return context.application.bot_data["access"]
 
-    if auth.is_allowed(settings, user.id if user else None):
+
+class _RejectThrottle:
+    """How often a non-allowed user is answered — and therefore how often it is logged.
+
+    One answer per user per ``config.REJECT_REPLY_INTERVAL_S``. Two channels use a throttle of
+    this shape, each with its own instance: the message a stranger is sent, and the alert popped
+    up when they tap a button. Without one, anyone who finds the bot can make it issue one
+    Telegram API call per message they send, which burns the bot's global send budget and gets
+    it flood-banned: a stranger could take the bot offline for the people it exists to serve.
+
+    Keyed on the USER, not the chat, because the user is what an attacker controls — one key per
+    chat would let a single account spam every group the bot belongs to. The cost is that someone
+    rejected in one chat is not answered again in another until the interval passes, which is the
+    right trade: they already have the only thing the reply tells them.
+
+    In memory, not SQLite. The only state worth keeping is "did we answer this person a moment
+    ago", and a restart clearing it is harmless — Android kills this process often and a spammer
+    cannot make it restart. Staying out of the database also means a flood of rejected messages
+    costs no writes at all.
+
+    A refused call does NOT refresh the clock, so a sustained flood cannot keep pushing its own
+    next answer further away and then collect a fresh one the moment it pauses.
+    """
+
+    def __init__(self) -> None:
+        self._answered: dict[int, float] = {}
+
+    def allow(self, user_id: int) -> bool:
+        """Whether this user may be answered now. Records it when the answer is allowed."""
+        now = time.monotonic()
+        last = self._answered.get(user_id)
+        if last is not None and now - last < config.REJECT_REPLY_INTERVAL_S:
+            return False
+        self._answered[user_id] = now
+        if len(self._answered) > config.REJECT_TRACKED_MAX:
+            self._prune(now)
+        return True
+
+    def _prune(self, now: float) -> None:
+        """Drop keys whose interval has expired anyway, then the oldest until the ceiling holds.
+
+        Evicting a key that is still live only costs that user one extra reply, so oldest-first
+        is a safe fallback and the loop cannot spin.
+        """
+        for stale in [
+            key for key, at in self._answered.items()
+            if now - at >= config.REJECT_REPLY_INTERVAL_S
+        ]:
+            del self._answered[stale]
+        while len(self._answered) > config.REJECT_TRACKED_MAX:
+            del self._answered[next(iter(self._answered))]
+
+
+# One instance per channel, not one shared. They answer different things — _rejects bounds the
+# message SENT to a stranger, _denials bounds the ALERT shown when they tap a button — and a
+# shared key space would let a message rejection consume a user's alert, so they would tap a
+# dead button and never be told why. Each is bounded independently by REJECT_TRACKED_MAX.
+_rejects = _RejectThrottle()
+_denials = _RejectThrottle()
+
+
+def _denied_text(user_id: int, *, discovery: bool) -> str:
+    """What a non-allowed user is told. Both variants include their own id.
+
+    The id is not a secret — it is theirs, and any bot on Telegram will tell it to them — and
+    without it an administrator has to go digging through the logs to allowlist someone who has
+    just asked for access. ``discovery`` is an empty allowlist, where nobody has been configured
+    yet and the id is the whole point of the reply.
+    """
+    id_block = f"Your Telegram user id is:\n\n<code>{user_id}</code>\n\n"
+    if discovery:
+        return (
+            "This bot is not configured yet, so it is not accepting messages.\n\n"
+            f"{id_block}"
+            "Add it to TG_ALLOWED_IDS in .env and restart."
+        )
+    return (
+        "Sorry, access to this bot is restricted to authorized users only.\n\n"
+        f"{id_block}"
+        "If you believe you should have access, send that id to the administrator."
+    )
+
+
+async def _deny_callback(query, user) -> None:
+    """Answer a button press from a non-allowed user, showing the alert at most once a minute.
+
+    ``query.answer()`` itself is NOT optional and is never suppressed: without it Telegram leaves
+    the button showing a spinning clock, so the user has no way to tell the tap was refused from
+    the bot having hung. Only the ``show_alert`` modal is throttled, because that is the part that
+    costs an outbound API call per tap.
+
+    Separate from :func:`_reject` because the two channels answer different things and must not
+    spend each other's budget — see the note on the throttle instances.
+
+    A stranger can only reach a button on a message the bot already sent, so in practice this is
+    someone who was allowlisted, received a /sessions menu, and was later removed. They get told
+    why once, and after that their dead buttons simply stop spinning.
+    """
+    if user is not None and _denials.allow(user.id):
+        log.warning("rejected a callback from unauthorized user id=%s", user.id)
+        await query.answer("Not authorized", show_alert=True)
+    else:
+        await query.answer()
+
+
+async def _reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Return True if this update should be ignored.
+
+    The log line is tied to the reply, so one throttle bounds both: a flood cannot fill the
+    rotating log either. The FIRST rejection still logs the id at warning level, which is the
+    one an administrator needs, and repeats drop to debug.
+    """
+    user = update.effective_user
+    access = _access(context)
+
+    if access.is_allowed(user.id if user else None):
         return False
 
-    # Logged once at warning level. The reply below explains to the user what happened.
-    log.warning("rejected update from unauthorized user id=%s", user.id if user else None)
+    if user is None or update.effective_chat is None:
+        return True
 
-    if update.effective_chat and user:
-        if settings.allowlist_open:
-            # Empty allowlist means first-run discovery: the owner needs their own id.
-            await _reply(
-                update,
-                "This bot is not configured yet. Your Telegram user id is:\n\n"
-                f"<code>{user.id}</code>\n\n"
-                "Add it to TG_ALLOWED_IDS in .env and restart.",
-            )
-        else:
-            # Populated allowlist with a non-whitelisted user: they don't have access.
-            await _reply(
-                update,
-                "Sorry, access to this bot is restricted to authorized users only. "
-                "Please contact your administrator if you believe you should have access."
-            )
+    if _rejects.allow(user.id):
+        log.warning("rejected update from unauthorized user id=%s", user.id)
+        await _reply(
+            update, _denied_text(user.id, discovery=access.discovery_mode)
+        )
+    else:
+        log.debug("already answered user id=%s; ignoring a repeat", user.id)
     return True
 
 
@@ -194,9 +301,10 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except BillingError as exc:
         await _reply(
             update,
-            f"Credits exhausted: {tg_html.escape(exc.message)}\n\n"
-            "You have no available credit to start a new conversation.\n"
-            "Please renew your plan or purchase a resource package to continue.",
+            tg_html.escape(budget.exhausted_notice(
+                exc.message,
+                blocked="You have no available credit to start a new conversation.",
+            )),
             error=True,
         )
         return
@@ -349,13 +457,20 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         applied = await manager.api.apply_agent_model(user.id, wanted)
     except QoderError as exc:
-        await _reply(
-            update,
-            f"Saved <code>{tg_html.escape(wanted)}</code>, but could not apply it to your agent "
-            f"yet: {tg_html.escape(exc.message)}. It will be applied when you next use /new.",
-            error=True,
-        )
-        return
+        # A concurrent change (e.g. running /effort at the same time) returns 409 "Version conflict".
+        # Don't show this raw exception as an error — it's not a user problem, just two updates
+        # clashing. The model is saved locally; next time they run /new it will take effect from
+        # a clean state.
+        if exc.status == 409:
+            log.debug("model update hit a version conflict (%s); saving anyway", exc.message)
+        else:
+            await _reply(
+                update,
+                f"Saved <code>{tg_html.escape(wanted)}</code>, but could not apply it to your agent "
+                f"yet: {tg_html.escape(exc.message)}. It will be applied when you next use /new.",
+                error=True,
+            )
+            return
 
     # What effort this model will actually run at. A stored preference is never cleared by a
     # switch, and model_ref drops any level the new model does not advertise — so without this
@@ -474,13 +589,20 @@ async def cmd_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         applied = await manager.api.apply_agent_model(user.id, model_id)
     except QoderError as exc:
-        await _reply(
-            update,
-            f"Saved <code>{tg_html.escape(wanted)}</code>, but could not apply it to your agent "
-            f"yet: {tg_html.escape(exc.message)}. It will be applied when you next use /new.",
-            error=True,
-        )
-        return
+        # A concurrent change (e.g. running /model at the same time) returns 409 "Version conflict".
+        # Don't show this raw exception as an error — it's not a user problem, just two updates
+        # clashing. The effort is saved locally; next time they run /new it will take effect from
+        # a clean state.
+        if exc.status == 409:
+            log.debug("effort update hit a version conflict (%s); saving anyway", exc.message)
+        else:
+            await _reply(
+                update,
+                f"Saved <code>{tg_html.escape(wanted)}</code>, but could not apply it to your agent "
+                f"yet: {tg_html.escape(exc.message)}. It will be applied when you next use /new.",
+                error=True,
+            )
+            return
 
     if not applied:
         await _reply(
@@ -644,20 +766,31 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if agent_model != "?":
         lines.append(f"agent model: <code>{tg_html.escape(agent_model)}</code>")
 
-    # Per-user toggles that have no visible effect otherwise. effort shows applied effort for the current model,
-    # or "none (this model has no adjustable effort)" when the target model lacks an efforts field. credit_budget
-    # shows their hard limit; default is 1000 per config.DEFAULT_CREDIT_BUDGET.
-    lines.append(
-        f"effort: <code>{_effort_description(db, user.id)}</code>"
-        f" · budget: <code>{user['credit_budget']:.0f}</code>"
-        f" · tools: <{'on' if user['show_tools'] else 'off'}></code>"
-    )
-
+    # Fetched here, above the effort line, because resolving an effort needs the model's own
+    # ``efforts`` array and only the catalog carries it. A failure costs the effort detail and
+    # is reported on its own line rather than discarding the whole report.
     try:
         models = await manager.api.list_models(use_cache=False)
-        lines.append(f"qoder api: <code>ok ({len(models)} models)</code>")
     except QoderError as exc:
-        lines.append(f"qoder api: <b>FAILING</b> — {tg_html.escape(exc.message)}")
+        models = []
+        api_line = f"qoder api: <b>FAILING</b> — {tg_html.escape(exc.message)}"
+    else:
+        api_line = f"qoder api: <code>ok ({len(models)} models)</code>"
+
+    # Per-user toggles that have no visible effect otherwise. effort shows the level in effect
+    # for the current model, or "no adjustable effort on this model" when it advertises none.
+    #
+    # ensure_user, not get_user: /health may be the first command a newly allowlisted user
+    # sends, and there is no row to read yet. Subscripting update.effective_user instead — a
+    # telegram.User, which has none of these columns — raised on every single /health.
+    user_row = auth.ensure_user(db, settings, user.id, user.username)
+    lines.append(
+        f"effort: <code>{tg_html.escape(_effort_description(db, models, user.id))}</code>"
+        f" · budget: <code>{budget.budget_label(user_row['credit_budget'])}</code>"
+        f" · tools: <code>{'on' if user_row['show_tools'] else 'off'}</code>"
+    )
+
+    lines.append(api_line)
 
     # Read-only. _active() would ADOPT the conversation — three tasks and an SSE stream —
     # which is not a side effect a diagnostic command should have.
@@ -677,10 +810,21 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         # own row. A session keeps the model it was created with — /model only takes effect on
         # the next /new — so this is the figure being billed, and the one to compare against the
         # console when the two disagree.
-        session = await manager.api.get_session(crow["session_id"]) if crow["session_id"] else None
-        actual = (((session or {}).get("agent") or {}).get("model") or {}).get("id")
-        if actual:
-            lines.append(f"session model: <code>{tg_html.escape(str(actual))}</code>")
+        #
+        # Guarded: this is the last network call /health makes, after most of the report is
+        # already assembled, and a blip here used to discard all of it.
+        session_model = None
+        if crow["session_id"]:
+            try:
+                session = await manager.api.get_session(crow["session_id"])
+            except QoderError as exc:
+                log.debug("could not read session %s for /health: %s",
+                          crow["session_id"], exc.message)
+            else:
+                agent_model_obj = ((session or {}).get("agent") or {}).get("model") or {}
+                session_model = agent_model_obj.get("id")
+        if session_model:
+            lines.append(f"session model: <code>{tg_html.escape(str(session_model))}</code>")
 
     recoverable = auth.list_recoverable_conversations(db, user.id, limit=100)
     if recoverable:
@@ -702,6 +846,194 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines.append(f"your messages awaiting dispatch: <code>{queued['n'] if queued else 0}</code>")
     lines.append(f"max concurrent streams: <code>{settings.max_live_streams}</code>")
     await _reply(update, "\n".join(lines))
+
+
+# --- administrator commands ---------------------------------------------------------
+# Gated on _require_admin. The admin id is fixed from TG_ADMIN_ID and is not writable at
+# runtime, so these are the only path to mutate the allowlist or rotate the API token from
+# Telegram. They are deliberately NOT advertised in HELP_TEXT or the command menu, which every
+# user sees; the admin discovers them through /admin.
+
+
+async def _require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True if the caller is the administrator; otherwise refuse and return False.
+
+    Every caller runs ``_reject`` first, so a stranger never reaches here — only an allowlisted
+    non-admin can, and they are told plainly. The refusal is not throttled on purpose: only
+    trusted, allowlisted users can trigger it, so it cannot be used to burn the send budget the
+    way a stranger's flood could.
+    """
+    access = _access(context)
+    user = update.effective_user
+    if access.is_admin(user.id if user else None):
+        return True
+    await _reply(update, "That command is restricted to the administrator.", error=True)
+    return False
+
+
+def _parse_id_arg(args) -> int | None:
+    """A positive Telegram user id from the first command argument, or None."""
+    if not args:
+        return None
+    try:
+        uid = int(args[0].strip())
+    except ValueError:
+        return None
+    return uid if uid > 0 else None
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject(update, context):
+        return
+    if not await _require_admin(update, context):
+        return
+    await _reply(update, (
+        "<b>Administrator commands</b>\n"
+        "<code>/allow &lt;id&gt;</code> — let a user id use the bot\n"
+        "<code>/disallow &lt;id&gt;</code> — revoke a user id\n"
+        "<code>/allowed</code> — show the admin id and the allowlist\n"
+        "<code>/setpat &lt;token&gt;</code> — validate and hot-swap the Qoder API token\n\n"
+        "Changes take effect immediately and survive a restart. The admin id itself is fixed by "
+        "TG_ADMIN_ID in .env and cannot be changed from here."
+    ))
+
+
+async def cmd_allow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject(update, context):
+        return
+    if not await _require_admin(update, context):
+        return
+    uid = _parse_id_arg(context.args)
+    if uid is None:
+        await _reply(
+            update,
+            "Usage: <code>/allow &lt;user_id&gt;</code>. The id is the number, not the @username "
+            "— the person can get it from /start.",
+            error=True,
+        )
+        return
+    _access(context).add(uid)
+    log.info("admin allowlisted user id=%s", uid)
+    await _reply(update, f"Allowed <code>{uid}</code>. They can use the bot now — no restart needed.")
+
+
+async def cmd_disallow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject(update, context):
+        return
+    if not await _require_admin(update, context):
+        return
+    access = _access(context)
+    uid = _parse_id_arg(context.args)
+    if uid is None:
+        await _reply(update, "Usage: <code>/disallow &lt;user_id&gt;</code>.", error=True)
+        return
+    if access.is_admin(uid):
+        await _reply(
+            update,
+            "That is the administrator id, which is always allowed and cannot be removed.",
+            error=True,
+        )
+        return
+    access.remove(uid)
+    log.info("admin revoked user id=%s", uid)
+    await _reply(
+        update,
+        f"Removed <code>{uid}</code> from the allowlist. Their next message will be refused.",
+    )
+
+
+async def cmd_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject(update, context):
+        return
+    if not await _require_admin(update, context):
+        return
+    access = _access(context)
+    lines = ["<b>Access</b>"]
+    if access.admin_id is not None:
+        lines.append(f"administrator: <code>{access.admin_id}</code>")
+    else:
+        lines.append("administrator: <i>none set (TG_ADMIN_ID is empty)</i>")
+    ids = access.snapshot()
+    if ids:
+        lines.append("allowed users:\n" + "\n".join(f"  • <code>{i}</code>" for i in ids))
+    else:
+        lines.append("allowed users: <i>none — only the administrator</i>")
+    lines.append(
+        "\n<code>/allow &lt;id&gt;</code> · <code>/disallow &lt;id&gt;</code> · "
+        "<code>/setpat &lt;token&gt;</code>"
+    )
+    await _reply(update, "\n".join(lines))
+
+
+async def cmd_setpat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Validate a new Qoder PAT and hot-swap the backend onto it, without a restart.
+
+    The token is a secret that arrives as plaintext in a Telegram message, so two rules govern
+    this handler: it is NEVER logged or echoed (only its non-reversible fingerprint is shown),
+    and the invoking message is deleted best-effort so the token does not linger in the chat.
+    Deletion cannot be relied on — a bot cannot delete a user's message in a DM and may lack
+    rights in a group — so the usage text also tells the admin to prefer a DM.
+    """
+    if await _reject(update, context):
+        return
+    if not await _require_admin(update, context):
+        return
+
+    token = context.args[0].strip() if context.args else ""
+    if not token:
+        await _reply(update, (
+            "Usage: <code>/setpat &lt;token&gt;</code>\n\n"
+            "The token is validated first, then swapped in live. Active conversations lose their "
+            "cloud session — as any token rotation does — and rebuild from the on-device "
+            "transcript on your next message.\n\n"
+            "⚠ A command sent here stays in the chat history. Prefer a DM; the bot deletes the "
+            "message best-effort after reading it."
+        ), error=True)
+        return
+
+    message = update.effective_message
+    if message is not None:
+        try:
+            await message.delete()
+        except Exception:  # noqa: BLE001 - deletion is best-effort; rights are often absent
+            pass
+
+    app = context.application
+    try:
+        await runtime.hot_swap_pat(app, token)
+    except Unauthorized as exc:
+        log.warning("PAT swap rejected by the API: %s", exc.message)
+        await _reply(update, (
+            f"That token was rejected ({tg_html.escape(exc.message)}). "
+            "The current one is still in use."
+        ), error=True)
+        return
+    except QoderError as exc:
+        log.warning("PAT swap failed: %s", exc.message)
+        await _reply(update, (
+            f"Could not switch to that token: {tg_html.escape(exc.message)}. "
+            "The current one is still in use."
+        ), error=True)
+        return
+    except Exception:  # noqa: BLE001 - never leak the token in a traceback to the chat
+        log.exception("PAT swap failed unexpectedly")
+        await _reply(update, (
+            "Could not switch tokens; the current one is still in use. Check the log for detail."
+        ), error=True)
+        return
+
+    settings = context.application.bot_data["settings"]
+    body = f"Switched to the new token <code>{_pat_fingerprint(settings.qoder_pat)}</code>."
+    startup_error = context.application.bot_data.get("startup_error")
+    if startup_error:
+        body += (
+            f"\n\n⚠ Re-provisioning reported: {tg_html.escape(str(startup_error))}\n"
+            "It will be retried on your next /new."
+        )
+    else:
+        body += "\n\nActive conversations will rebuild from their on-device history on the next message."
+    log.info("PAT swapped from Telegram by the administrator")
+    await _reply(update, body)
 
 
 class _MigrationFilter(filters.MessageFilter):
@@ -850,9 +1182,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if query is None:
         return
     user = query.from_user
-    settings = context.application.bot_data["settings"]
-    if not auth.is_allowed(settings, user.id if user else None):
-        await query.answer("Not authorized", show_alert=True)
+    access = _access(context)
+    if not access.is_allowed(user.id if user else None):
+        await _deny_callback(query, user)
         return
 
     # Always answer, or Telegram shows a spinning clock to the user.
@@ -884,11 +1216,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 convo_id=int(arg),
             )
         except BillingError as exc:
-            await query.edit_message_text(
-                f"⚠ Credits exhausted: {exc.message}\n\n"
-                "You have no available credit to restore that conversation.\n"
-                "Please renew your plan or purchase a resource package to continue.",
-            )
+            await query.edit_message_text(budget.exhausted_notice(
+                exc.message,
+                blocked="You have no available credit to restore that conversation.",
+            ))
             return
         except QoderError as exc:
             await query.edit_message_text(f"Could not restore that conversation: {exc.message}")
@@ -945,8 +1276,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"Started <b>{tg_html.escape(convo.title or 'a new conversation')}</b>.",
             parse_mode=ParseMode.HTML,
         )
-
-
 
 
 # --- helpers ------------------------------------------------------------------------
@@ -1008,9 +1337,10 @@ async def _active(
         # Starting cold would fail the same way, so there is nothing to fall through to.
         await _reply(
             update,
-            f"Credits exhausted: {tg_html.escape(exc.message)}\n\n"
-            "You have no available credit to restore that conversation.\n"
-            "Please renew your plan or purchase a resource package to continue.",
+            tg_html.escape(budget.exhausted_notice(
+                exc.message,
+                blocked="You have no available credit to restore that conversation.",
+            )),
             error=True,
         )
         return None, None
@@ -1047,13 +1377,13 @@ async def _active(
             reuse_if_active=True,
         )
     except BillingError as exc:
-        # User sent a message mid-conversation but has no credits — show them the error
-        # clearly and explain they can renew their plan.
+        # The user sent a message with no credits left. Say so plainly and point at renewal.
         await _reply(
             update,
-            f"Credits exhausted: {tg_html.escape(exc.message)}\n\n"
-            "You have no available credit to continue this conversation.\n"
-            "Please renew your plan or purchase a resource package to continue.",
+            tg_html.escape(budget.exhausted_notice(
+                exc.message,
+                blocked="You have no available credit to continue this conversation.",
+            )),
             error=True,
         )
         return None, None
@@ -1096,11 +1426,14 @@ async def _reply(
             message_thread_id=thread_id,
             reply_markup=reply_markup,
         )
-    except Exception:  # noqa: BLE001 - a failed reply must never break the handler
+    except Exception as exc:  # noqa: BLE001 - a failed reply must never break the handler
         log.exception("could not reply in chat %s", chat.id)
+        # Fallback on the original exception, not a second attempt at retrying: sending plain
+        # text is what survives any markup failure, and we don't need two tries to prove that.
         try:
             await chat.send_message(
                 tg_html.escape(prefix + text),
+                parse_mode=None,
                 message_thread_id=thread_id,
                 reply_markup=reply_markup,
             )
@@ -1111,20 +1444,30 @@ async def _reply(
 def _should_show_id(db, tg_user_id: int) -> bool:
     """Whether /start should echo the caller's own user id, at most once an hour.
 
-    NULL means never shown, and must not be subtracted from a timestamp: doing so raised
-    TypeError on every /start after the first.
+    NULL means never shown. Atomic on purpose: without this, concurrent /starts could both read
+    "show" and both update, echoing the id twice. Using a single UPDATE with a condition prevents
+    that race while avoiding the SELECT-then-UPDATE pattern altogether.
+
+    Returns True if the id was just echoed (the row was modified).
     """
-    row = db.query_one("SELECT last_id_request FROM users WHERE tg_user_id = ?", (tg_user_id,))
-    last = row["last_id_request"] if row else None
-    return last is None or time.time() - last > config.ID_REMINDER_S
+    try:
+        cur = db.execute(
+            """UPDATE users SET last_id_request = ?
+               WHERE tg_user_id = ? AND (last_id_request IS NULL OR datetime(last_id_request, 'unixepoch') < datetime('now', '-' || ? || ' seconds'))""",
+            (int(time.time()), tg_user_id, config.ID_REMINDER_S),
+        )
+        return bool(cur.rowcount)
+    except sqlite3.DatabaseError:  # noqa: BLE001 - if SQLite misbehaves, don't let it kill the handler
+        log.exception("could not update last_id_request")
+        return False
 
 
 def _size(size: int | None) -> str:
     if not size:
         return "?"
     value = float(size)
-    for unit in ("B", "KB", "MB", "GB"):
-        if value < 1024 or unit == "GB":
+    for unit in ("B", "KB", "MB"):
+        if value < 1024:
             return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     return f"{value:.1f} GB"
@@ -1236,47 +1579,24 @@ def _agent_model(db, tg_user_id: int) -> str:
     return f"{model_id} · effort {effort}" if effort else model_id
 
 
-def _effort_description(db: Database, tg_user_id: int) -> str:
-    """Human-readable effort display for /health."""
+def _effort_description(db: Database, models: list[dict], tg_user_id: int) -> str:
+    """Human-readable effort display for /health.
+
+    Resolved against the CATALOG, not against the agent's stored model object. ``model_ref``
+    builds only ``id``, ``effort`` and ``context_window`` — ``efforts`` and ``default_effort``
+    are catalog fields that never reach ``agents.model_json`` — so reading them off the agent
+    found nothing and reported "no adjustable effort" for every user on every model.
+    """
     user = auth.get_user(db, tg_user_id)
     stored_effort = user["effort"] if user else None
-    agent_model = _agent_model_ref(db, tg_user_id)
-    if not isinstance(agent_model, dict):
-        # Agent/model is missing/unparseable — just show what's stored.
+
+    ref = _agent_model_ref(db, tg_user_id)
+    if ref is None:
         return str(stored_effort) if stored_effort else "(unknown)"
+    model_id = str(ref.get("id")) if isinstance(ref, dict) else str(ref)
 
-    model_id = str(agent_model.get("id") or "?")
-    allowed = agent_model.get("efforts") or []
-    if not allowed:
-        return "none (this model has no adjustable effort)"
-    if not stored_effort:
-        default = agent_model.get("default_effort") or "(unspecified)"
-        return f"default ({default})"
-    if stored_effort in allowed:
-        return stored_effort
-    description = _effort_outcome(agent_model, stored_effort)[0]
-    return description if description else "(invalid level)"
-
-
-def _effort_outcome(model: dict | None, stored_effort: str | None) -> tuple[str, str | None]:
-    """Effort validation outcome for command replies and /health."""
-    if model is None:
-        return "effort unknown (that model is no longer in the catalog)", None
-    model_id = str(model.get("id") or "?")
-    allowed = model.get("efforts") or []
-    effective = str(model.get("default_effort") or "unspecified")
-    if not allowed:
-        warning = None
-        if stored_effort:
-            warning = (f"Your effort setting '{stored_effort}' is ignored by {model_id}, which has no adjustable effort.")
-        return "no adjustable effort on this model", warning
-    if stored_effort and stored_effort in allowed:
-        return f"effort {stored_effort} (your setting)", None
-    description = f"effort {effective} (this model's default)"
-    if not stored_effort:
-        return description, None
-    return description, (f"Your effort setting '{stored_effort}' does not apply to {model_id} — it offers "
-                         f"{', '.join(allowed)}. It will run at '{effective}' instead; use /effort to change that.")
+    model = next((m for m in models if m.get("id") == model_id), None)
+    return _effort_outcome(model, stored_effort)[0]
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1285,18 +1605,33 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     Without a registered error handler PTB logs "No error handlers are registered" and
     swallows the exception, so a crash presents to the user as the bot simply not replying.
     Saying something is always better than silence.
+
+    This is NOT throttled: a real bug should be reported immediately and once per update,
+    never suppressed by the reject throttle. The admin can see every one in the rotating log.
     """
-    log.exception("unhandled error while processing an update", exc_info=context.error)
+    # Check allowlist first so we don't waste an API call on someone who shouldn't interact
+    # with the bot at all. But even then, no throttle — this is a diagnostic path.
+    user = getattr(update, "effective_user", None)
+    if user:
+        access = context.application.bot_data.get("access")
+        if access and not access.is_allowed(user.id):
+            return
 
     chat = getattr(update, "effective_chat", None)
     if chat is None:
         return
+
+    # Log the full traceback to the server console / logs. The chat message is just the
+    # visible part of what happened.
+    log.exception("unhandled error while processing an update", exc_info=context.error)
+
     try:
-        # No parse mode: this message must not itself fail on markup. The thread id still has
+        # Plain text: this message must not itself fail on markup. The thread id still has
         # to be carried, or a failure inside a topic gets reported in General instead.
         await chat.send_message(
             "⚠ Something went wrong handling that. Please try again — /health shows what "
             "is still connected.",
+            parse_mode=None,
             message_thread_id=_thread_id(getattr(update, "effective_message", None)),
         )
     except Exception:  # noqa: BLE001 - an error handler must never raise
@@ -1318,6 +1653,13 @@ def register(app: Application) -> None:
     app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("archive", cmd_archive))
     app.add_handler(CommandHandler("health", cmd_health))
+
+    # Administrator-only. Gated inside each handler by _require_admin; not listed in the menu.
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("allow", cmd_allow))
+    app.add_handler(CommandHandler("disallow", cmd_disallow))
+    app.add_handler(CommandHandler(["allowed", "allowlist"], cmd_allowed))
+    app.add_handler(CommandHandler("setpat", cmd_setpat))
 
     app.add_handler(CallbackQueryHandler(on_callback))
 

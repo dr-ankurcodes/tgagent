@@ -13,10 +13,14 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, AsyncIterator
+from urllib.parse import urlsplit
 
 import httpx
 
+from . import __version__
 from .config import QODER_EVENTS_PAGE_MAX, SSE_STALL_TIMEOUT_S
 
 log = logging.getLogger("tgagent.qoder")
@@ -113,6 +117,30 @@ class BillingError(QoderError):
     """402. The user has run out of credits."""
 
 
+def _retry_after_seconds(raw: str | None) -> float | None:
+    """Parse a ``Retry-After`` header, which is either delta-seconds or an HTTP-date.
+
+    ``float(raw)`` alone silently discarded the date form: the parse failed, ``retry_after``
+    became None, and the caller fell back to a 1–4s schedule that re-429'd immediately because
+    the server had asked for a specific future instant.
+    """
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
 def _classify(resp: httpx.Response) -> QoderError:
     if resp.status_code in (401, 403):
         return Unauthorized.from_response(resp)
@@ -124,11 +152,7 @@ def _classify(resp: httpx.Response) -> QoderError:
         return Conflict.from_response(resp)
     if resp.status_code == 429:
         error = RateLimited.from_response(resp)
-        raw = resp.headers.get("Retry-After")
-        try:
-            error.retry_after = float(raw) if raw else None
-        except ValueError:
-            error.retry_after = None
+        error.retry_after = _retry_after_seconds(resp.headers.get("Retry-After"))
         return error
     return QoderError.from_response(resp)
 
@@ -152,7 +176,7 @@ class QoderClient:
             headers={
                 "Authorization": f"Bearer {pat}",
                 "Accept": "application/json",
-                "User-Agent": "tgagent/0.1",
+                "User-Agent": f"tgagent/{__version__}",
             },
             timeout=timeout,
             transport=transport,
@@ -187,6 +211,12 @@ class QoderClient:
         server acted, and replaying POST /sessions/{id}/events would run — and bill for —
         the same turn twice. Losing one turn to a flaky mobile link is recoverable: the
         caller's durable queue still holds it. Running it twice is not.
+
+        ``files`` and ``data`` are replayed verbatim on a retry. That is safe for the bytes
+        ``upload_file`` passes, but a caller that passed an OPEN FILE OBJECT would get a
+        silently empty or partial body on the second attempt, because the file position is
+        already at EOF. Pass bytes, or seek(0) is the caller's problem — this method does not
+        and cannot rewind a stream it does not own.
         """
         idempotent = method.upper() in IDEMPOTENT_METHODS
         retry_statuses = RETRY_STATUSES if idempotent else POST_RETRY_STATUSES
@@ -301,7 +331,21 @@ class QoderClient:
         Streamed rather than read whole, so ``max_bytes`` can abort a download that is larger
         than we are willing to hold in memory. The artifact event's declared ``size`` is not
         always present or accurate, so the real bound has to be enforced on the bytes.
+
+        HTTPS is enforced on the envelope's URL. No credential rides along, so the impact of a
+        non-HTTPS URL is limited to probing internal hosts from the phone — but the envelope is
+        attacker-influenceable if the API response is ever tampered with, and ``file://`` or
+        ``http://`` there would turn this method into an open redirect/probe. A host allowlist
+        is deliberately NOT used: the storage provider (currently aliyuncs.com) can change, and
+        pinning it would break downloads the day Qoder moves buckets.
         """
+        scheme = urlsplit(url).scheme.lower()
+        if scheme != "https":
+            raise QoderError(
+                0,
+                f"refusing to fetch a signed url with scheme {scheme!r}; only https is allowed",
+                error_type="unsafe_url",
+            )
         async with self._plain.stream("GET", url) as resp:
             if resp.status_code >= 400:
                 await resp.aread()
@@ -355,7 +399,10 @@ class QoderClient:
         if last_event_id:
             headers["Last-Event-ID"] = last_event_id
 
-        timeout = httpx.Timeout(None, connect=30.0, read=read_timeout)
+        # Pool and write are finite too. The previous ``Timeout(None, ...)`` left them
+        # unlimited, so a consumer waiting for a pool slot at shutdown could hang forever
+        # instead of failing into the reconnect loop. Read stays the stall detector.
+        timeout = httpx.Timeout(pool=30.0, connect=30.0, read=read_timeout, write=30.0)
         async with self._auth.stream(
             "GET",
             f"/sessions/{session_id}/events/stream",
@@ -369,8 +416,12 @@ class QoderClient:
             yield resp
 
     async def aclose(self) -> None:
-        await self._auth.aclose()
-        await self._plain.aclose()
+        # try/finally: if closing the authenticated client raises (e.g. during cancellation),
+        # the plain client's connection pool would otherwise leak for the life of the process.
+        try:
+            await self._auth.aclose()
+        finally:
+            await self._plain.aclose()
 
 
 async def iter_pages(
@@ -400,6 +451,10 @@ async def iter_pages(
             log.warning("pagination of %s made no progress at %s; stopping", path, after_id)
             return
         after_id = next_id
+    # Reaching here means the loop exhausted MAX_PAGES without the server reporting the end.
+    # iter_session_events logs this; iter_pages used to stop silently, so a collection lookup
+    # that hit the ceiling looked identical to one that finished normally.
+    log.warning("pagination of %s hit the %d page ceiling", path, MAX_PAGES)
 
 
 async def iter_session_events(

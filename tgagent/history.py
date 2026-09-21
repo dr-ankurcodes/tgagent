@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 from pathlib import Path
 
 from . import config, tg_html
@@ -33,6 +34,14 @@ log = logging.getLogger("tgagent.history")
 # Tool input/output blobs are truncated before storage. They are context for a summary, not a
 # faithful archive, and an unbounded Read result would otherwise dominate the transcript.
 TOOL_BLOB_MAX_CHARS = 2000
+
+# Grace period before an unreferenced cache file is treated as an orphan and swept. A copy a
+# concurrent retain_file has just written but not yet recorded must not be raced away.
+ORPHAN_GRACE_S = 3600
+
+# Reserved headroom for build_transcript's header, so the body never fills the whole budget and
+# is then pushed over it by the header prepended afterwards.
+_HEADER_RESERVE = 512
 
 # Pruning counts every row in the transcript, so doing it on every append made a long
 # conversation quadratic. seq is monotonic per conversation, which gives a stateless trigger:
@@ -207,24 +216,37 @@ def build_transcript(
 
     lines: list[str] = []
     for event in events:
-        lines.append(_render_event(event))
+        rendered = _render_event(event)
+        if rendered:
+            lines.append(rendered)
 
-    # Walk backwards, keeping the newest turns that fit.
+    # Reserve room for the header before filling the body. The header is part of what the model
+    # receives, so filling the body right up to max_chars and then prepending it pushed the total
+    # over the budget the header itself claimed to respect.
+    body_budget = max(0, max_chars - _HEADER_RESERVE)
+
+    # Walk backwards keeping a CONTIGUOUS newest suffix. The old loop `continue`d past a line that
+    # did not fit and kept older, smaller ones, so the result could have a hole in the middle
+    # while the header called it "the most recent part of the conversation" — the agent would read
+    # a gap as continuous context. Stopping at the first line that does not fit keeps that claim
+    # true; everything older is counted as dropped.
     kept: list[str] = []
     used = 0
-    dropped = 0
-    for line in reversed(lines):
+    idx = len(lines)
+    while idx > 0:
+        line = lines[idx - 1]
         cost = len(line) + 1
-        if used + cost > max_chars:
-            dropped += 1
-            continue
+        if used + cost > body_budget:
+            break
         kept.append(line)
         used += cost
+        idx -= 1
     kept.reverse()
+    dropped = idx
 
     header = ["[Previous conversation transcript, restored after the cloud session was lost.]"]
     if title:
-        header.append(f"Topic: {title}")
+        header.append(f"Topic: {tg_html.truncate(title, 120)}")
     if dropped:
         header.append(
             f"{dropped} earlier exchange(s) were dropped to fit the context window; "
@@ -361,25 +383,37 @@ def retain_file(
     """
     try:
         cache = config.file_cache_root()
-        # Sanitise: the filename comes from a Telegram upload or an agent-chosen artifact name,
-        # and either could contain a path separator that would escape the cache directory.
-        safe_name = Path(filename).name or f"{file_id}.bin"
-        dest = cache / f"{convo_id}_{file_id}_{safe_name}"
+        # Sanitised: the filename comes from a Telegram upload or an agent-chosen artifact name
+        # and the file id from the API, and either could contain a path separator that would
+        # escape the cache directory.
+        safe_id = config.safe_path_component(file_id, "unknown")
+        safe_name = config.safe_path_component(filename, f"{safe_id}.bin")
+        dest = cache / f"{convo_id}_{safe_id}_{safe_name}"
         dest.write_bytes(contents)
     except OSError as exc:
         log.warning("could not retain a local copy of %s: %s", filename, exc)
         return None
 
-    remember_local_file(
-        db,
-        convo_id=convo_id,
-        file_id=file_id,
-        path=dest,
-        size_bytes=len(contents),
-        owner_type=owner_type,
-        filename=safe_name,
-    )
-    evict_overflow(db)
+    try:
+        remember_local_file(
+            db,
+            convo_id=convo_id,
+            file_id=file_id,
+            path=dest,
+            size_bytes=len(contents),
+            owner_type=owner_type,
+            filename=safe_name,
+        )
+        evict_overflow(db)
+    except sqlite3.Error as exc:
+        # The bytes are on disk but the ledger row could not be written (a full or corrupt DB).
+        # This stays best-effort: an unrecorded copy is an orphan the sweep in evict_overflow
+        # collects later, whereas letting this propagate would fail the user's message or the
+        # artifact AFTER the API had already accepted it — exactly what the docstring promises
+        # cannot happen. remember_local_file swallows IntegrityError; this covers the rest
+        # (OperationalError on a full disk, and anything evict_overflow's writes can raise).
+        log.warning("retained %s on disk but could not record it: %s", filename, exc)
+        return dest
     return dest
 
 
@@ -392,26 +426,72 @@ def evict_overflow(db: Database) -> int:
     rows = db.query(
         "SELECT id, path, size_bytes FROM local_files ORDER BY created_at DESC"
     )
-    total = sum(int(row["size_bytes"] or 0) for row in rows)
-    if total <= config.FILE_CACHE_MAX_BYTES:
-        return 0
+    # Count only bytes that are actually on disk. The old total summed every row including ones
+    # whose file had already vanished (the OS cleared scratch, a crash left a partial write), so
+    # live files were evicted to compensate for phantom bytes — and the dead rows were never
+    # removed, so the phantom total persisted across every call.
+    live: list[sqlite3.Row] = []
+    total = 0
+    for row in rows:
+        if Path(row["path"]).exists():
+            live.append(row)
+            total += int(row["size_bytes"] or 0)
+        else:
+            db.execute("DELETE FROM local_files WHERE id = ?", (row["id"],))
 
-    freed = 0
-    # Oldest last in that ordering, so walk from the end and evict until it fits.
-    for row in reversed(rows):
-        if total <= config.FILE_CACHE_MAX_BYTES:
-            break
-        size = int(row["size_bytes"] or 0)
-        try:
-            Path(row["path"]).unlink(missing_ok=True)
-        except OSError as exc:
-            log.debug("could not evict %s: %s", row["path"], exc)
-        db.execute("DELETE FROM local_files WHERE id = ?", (row["id"],))
-        total -= size
-        freed += size
-    if freed:
-        log.info("evicted %d bytes of cached conversation files to stay under the ceiling", freed)
+    if total > config.FILE_CACHE_MAX_BYTES:
+        freed = 0
+        # Oldest last in that ordering, so walk from the end and evict until it fits.
+        for row in reversed(live):
+            if total <= config.FILE_CACHE_MAX_BYTES:
+                break
+            size = int(row["size_bytes"] or 0)
+            try:
+                Path(row["path"]).unlink(missing_ok=True)
+            except OSError as exc:
+                log.debug("could not evict %s: %s", row["path"], exc)
+            db.execute("DELETE FROM local_files WHERE id = ?", (row["id"],))
+            total -= size
+            freed += size
+        if freed:
+            log.info(
+                "evicted %d bytes of cached conversation files to stay under the ceiling", freed
+            )
+    else:
+        freed = 0
+
+    _sweep_orphans(db)
     return freed
+
+
+def _sweep_orphans(db: Database) -> None:
+    """Remove cache files that have no ledger row.
+
+    A crash between ``write_bytes`` and ``remember_local_file`` leaves bytes on disk that nothing
+    references. They are invisible to the size total — which is summed from rows — so eviction
+    never reclaims them and they accumulate until the phone fills. Only files older than
+    ``ORPHAN_GRACE_S`` are touched, so a copy a concurrent ``retain_file`` has just written but
+    not yet recorded is never raced away.
+    """
+    try:
+        cache = config.file_cache_root()
+        entries = list(cache.iterdir())
+    except OSError as exc:
+        log.debug("orphan sweep could not read the cache directory: %s", exc)
+        return
+
+    known = {row["path"] for row in db.query("SELECT path FROM local_files")}
+    cutoff = time.time() - ORPHAN_GRACE_S
+    for entry in entries:
+        if not entry.is_file() or str(entry) in known:
+            continue
+        try:
+            if entry.stat().st_mtime > cutoff:
+                continue
+            entry.unlink()
+            log.info("removed an orphaned cache file %s", entry.name)
+        except OSError as exc:
+            log.debug("could not sweep orphan %s: %s", entry, exc)
 
 
 def load_local_files(db: Database, convo_id: int) -> list[sqlite3.Row]:

@@ -9,6 +9,7 @@ from the published docs, README.md records the discrepancy.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -54,8 +55,10 @@ def model_ref(
     (``auto``, ``lite``, ``efficient``) list no windows at all and reject the field outright,
     so it is omitted for them.
 
-    Hardcoding a window therefore breaks switching to those models — ``kmodel`` only offers
-    256000, so the 200000 the bot used to send was refused.
+    Hardcoding a window therefore breaks switching to those models. The catalog is the only
+    source of truth and it drifts: README §10 records ``kmodel`` reporting no
+    ``max_input_tokens`` at all as of 2026-09-13, where an earlier capture had it at 256000.
+    A specific number quoted here would outlive the change it describes, so none is.
 
     ``effort`` is gated the same way, and the gate is load-bearing rather than cosmetic. The
     API rejects a level the model does not advertise — ``400 Field 'model.effort' is not
@@ -105,6 +108,22 @@ class QoderAPI:
     def __init__(self, client: QoderClient, db: Database):
         self.client = client
         self.db = db
+        # Per-user provisioning locks, shared by ensure_user_agent and ensure_memory_store.
+        # Both do check-cache -> list-remote -> create, and the Manager's own lock is keyed on
+        # (chat_id, message_thread_id) — so the SAME user opening two conversations concurrently
+        # (a DM and a group topic, which concurrent_updates(10) permits) raced both and could
+        # mint duplicate agents or memory stores, orphaning one remotely where nothing ever
+        # deletes it. Keying on tg_user_id closes that without serialising different users.
+        # Bounded in practice by the allowlist; no eviction is worth the complexity here.
+        self._provision_locks: dict[int, asyncio.Lock] = {}
+
+    def provision_lock(self, tg_user_id: int) -> asyncio.Lock:
+        """The provisioning lock for one user. Created lazily; safe to call from async code."""
+        lock = self._provision_locks.get(tg_user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._provision_locks[tg_user_id] = lock
+        return lock
 
     # --- models -------------------------------------------------------------------
 
@@ -146,6 +165,17 @@ class QoderAPI:
                 error_type="invalid_request_error",
                 param="model",
             )
+        # Lenient miss against the cache. Before substituting the default, re-read the live
+        # catalog once: ids, names and prices drift (README §10 records two renames since the
+        # Phase 0 capture), and a stale cache is precisely what hides a model the account now
+        # offers. Without this the lenient path silently fell back to DEFAULT_MODEL forever
+        # after a rename, with no path to refresh short of an explicit strict /model.
+        live = await self.list_models(use_cache=False)
+        for model in live:
+            if model.get("id") == preferred and model.get("is_enabled", True):
+                log.info("model %r resolved from the live catalog after a cache miss", preferred)
+                return model
+        models = live
         for fallback in (config.DEFAULT_MODEL, "auto", "lite"):
             for model in models:
                 if model.get("id") == fallback and model.get("is_enabled", True):
@@ -263,48 +293,53 @@ class QoderAPI:
         /model used to be written to the database and then quietly ignored.
         """
         name = config.agent_name(tg_user_id)
-        cached = self.db.query_one("SELECT agent_id FROM agents WHERE tg_user_id = ?", (tg_user_id,))
-        if cached:
-            # Only a definitive 404 discards the cache. A blip on a mobile link is not proof
-            # the agent is gone, and treating it as such mints a duplicate on every bad boot.
-            try:
-                remote = await self.client.get(f"/agents/{cached['agent_id']}")
-            except NotFound:
-                log.warning("cached agent %s no longer exists; creating a fresh one",
-                            cached["agent_id"])
-                self._forget_agent(cached["agent_id"])
-            except QoderError as exc:
-                log.warning("could not validate agent %s (%s); using it anyway",
-                            cached["agent_id"], exc.message)
-                return cached["agent_id"]
-            else:
-                log.debug("validated agent %s for user %s", cached["agent_id"], tg_user_id)
-                self._remember_agent(remote, tg_user_id)
-                await self._sync_model(remote, model_id, tg_user_id)
-                return remote["id"]
+        async with self.provision_lock(tg_user_id):
+            cached = self.db.query_one("SELECT agent_id FROM agents WHERE tg_user_id = ?", (tg_user_id,))
+            if cached:
+                # Only a definitive 404 discards the cache. A blip on a mobile link is not proof
+                # the agent is gone, and treating it as such mints a duplicate on every bad boot.
+                try:
+                    remote = await self.client.get(f"/agents/{cached['agent_id']}")
+                except NotFound:
+                    log.warning("cached agent %s no longer exists; creating a fresh one",
+                                cached["agent_id"])
+                    self._forget_agent(cached["agent_id"])
+                except QoderError as exc:
+                    log.warning("could not validate agent %s (%s); using it anyway",
+                                cached["agent_id"], exc.message)
+                    return cached["agent_id"]
+                else:
+                    log.debug("validated agent %s for user %s", cached["agent_id"], tg_user_id)
+                    self._remember_agent(remote, tg_user_id)
+                    await self._sync_model(remote, model_id, tg_user_id)
+                    return remote["id"]
 
-        agent = await self._adopt_agent_by_name(name, tg_user_id)
-        if agent is None:
-            agent = await self._create_agent(name, tg_user_id, model_id)
-            log.info("created agent %s for user %s", agent["id"], tg_user_id)
-        else:
-            await self._sync_model(agent, model_id, tg_user_id)
-        return agent["id"]
+            agent = await self._adopt_agent_by_name(name, tg_user_id)
+            if agent is None:
+                agent = await self._create_agent(name, tg_user_id, model_id)
+                log.info("created agent %s for user %s", agent["id"], tg_user_id)
+            else:
+                await self._sync_model(agent, model_id, tg_user_id)
+            return agent["id"]
 
     def agent_for_user(self, tg_user_id: int) -> str | None:
         """This user's cached agent id, or None if they have never started a conversation."""
         row = self.db.query_one("SELECT agent_id FROM agents WHERE tg_user_id = ?", (tg_user_id,))
         return row["agent_id"] if row else None
 
-    async def apply_agent_model(self, tg_user_id: int, model_id: str) -> str | None:
+    async def apply_agent_model(self, tg_user_id: int, model_id: str) -> bool:
         """Re-apply this user's model AND effort to their agent.
 
-        Returns the agent id, or None if they do not have one yet — in which case
-        ``users.model_id`` and ``users.effort`` carry the choice and the agent is created with
-        both on their next conversation.
+        Returns whether the change reached an agent. False means the user has no agent yet, in
+        which case ``users.model_id`` and ``users.effort`` carry the choice and the agent is
+        created with both on their next conversation — so both callers report it as "takes
+        effect from your next /new" rather than as a failure.
 
-        One PUT for both because they are fields of the same object and PUT replaces it whole.
-        /model and /effort each change one field but must send the other unchanged, so they
+        A bool, not the agent id: every caller only ever asked "did this land?", and returning
+        an id left them branching on the truthiness of a string.
+
+        One PUT for both fields because they belong to the same object and PUT replaces it
+        whole. /model and /effort each change one but must send the other unchanged, so they
         share this path rather than each assembling a partial update.
 
         Strict: an explicit user choice must surface as an error rather than be quietly replaced
@@ -312,12 +347,12 @@ class QoderAPI:
         """
         agent_id = self.agent_for_user(tg_user_id)
         if agent_id is None:
-            return None
+            return False
         await self.set_agent_model(
             agent_id, await self._model_ref(model_id, tg_user_id, strict=True)
         )
-        log.info("user %s agent set to %s", tg_user_id, agent_id)
-        return agent_id
+        log.info("user %s agent %s set to %s", tg_user_id, agent_id, model_id)
+        return True
 
     def _effort_for(self, tg_user_id: int) -> str | None:
         """This user's stored effort preference, or None to let the model use its own default."""
@@ -507,7 +542,9 @@ class QoderAPI:
                     raise
                 log.info("agent %s changed underneath us; retrying against a fresh read",
                          agent_id)
-        raise QoderError(409, "agent update kept conflicting", error_type="conflict_error")
+        # Unreachable: attempt 0 either returns or continues to attempt 1, and attempt 1 either
+        # returns or re-raises the Conflict above. The trailing QoderError(409) that used to sit
+        # here was dead code that implied a third path the loop cannot take.
 
     def _owner_of(self, agent_id: str) -> int | None:
         row = self.db.query_one("SELECT tg_user_id FROM agents WHERE agent_id = ?", (agent_id,))

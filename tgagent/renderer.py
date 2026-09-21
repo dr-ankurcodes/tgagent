@@ -66,6 +66,16 @@ class ChatGone(Exception):
     """The chat is unreachable: the user blocked the bot or deleted the chat. Fatal."""
 
 
+class MessageTooLong(Exception):
+    """Telegram rejected the text as exceeding its 4096-character cap.
+
+    Distinct from the four retryable outcomes because retrying the SAME over-cap string can never
+    succeed: the renderer retains buffered content across failures by design, so an unmapped
+    over-cap send would be retried forever and wedge the conversation. Handled by falling back to
+    a truncated plain-text send that always fits.
+    """
+
+
 class Sink(Protocol):
     async def send_text(self, chat_id: int, text: str, *, parse_mode: str | None) -> int: ...
 
@@ -152,6 +162,25 @@ STATUS_WORKING = "working…"
 STATUS_DONE = "done"
 QUIET_STATUS_LINES = frozenset({STATUS_WORKING, STATUS_DONE})
 
+# Markers identifying a tool result that failed because the credit balance ran out. Matched on
+# the RESULT text, never on the tool's input: the input is arbitrary content the agent chose, so
+# a failed Grep for "credit_score" used to be mistaken for a billing failure and its line left
+# spinning. "402" alone is not a marker — it appears in ordinary tool output far too often.
+BILLING_MARKERS = ("billing_error", "insufficient credit", "no available credit", "credits exhausted")
+BILLING_SUMMARY = "failed (no credits)"
+
+
+def _is_billing_failure(payload: dict) -> bool:
+    """Whether a tool_result reports an exhausted credit balance rather than a tool failure."""
+    if not payload.get("is_error"):
+        return False
+    text = " ".join(
+        block.get("text") or ""
+        for block in payload.get("content") or []
+        if isinstance(block, dict)
+    ).lower()
+    return any(marker in text for marker in BILLING_MARKERS)
+
 
 @dataclass
 class _ToolLine:
@@ -233,6 +262,10 @@ class Renderer:
     fatal: bool = False
 
     _hook_tasks: set = field(default_factory=set)
+    # The run loop's stop event, captured so the FloodWait sleeps can honour a shutdown instead
+    # of blocking it. None outside run() — force_flush during teardown has no event to watch, so
+    # the sleep helper falls back to a plain asyncio.sleep there.
+    _stop: asyncio.Event | None = field(default=None, repr=False, compare=False)
 
     # --- inbound ------------------------------------------------------------------
 
@@ -462,19 +495,15 @@ class Renderer:
         tool_use_id = payload.get("tool_use_id")
         for line in reversed(self.tool_lines):
             if line.tool_use_id == tool_use_id and line.state == "running":
-                is_error = bool(payload.get("is_error"))
-                # Billing errors mid-turn come through as tool results with error status. Don't
-                # render them as obscure tool failures; let the pump/consumer handle them via the
-                # normal billing notice path. Detect by looking for "credit" or HTTP 402 in the
-                # line summary (which gets truncated but still matches).
-                summary_lower = str(line.summary or "").lower()
-                if is_error and ("credit" in summary_lower or "402" in summary_lower or "billing" in summary_lower):
-                    # Leave the line state as-is (error ✓ will show); we'll get a proper notice
-                    # from the pump/consumer which is clearer. This avoids the "⚠ billing_error"
-                    # tool-line noise the user complained about.
-                    self.dirty_status = True
-                    return
-                line.state = "error" if is_error else "ok"
+                line.state = "error" if payload.get("is_error") else "ok"
+                if line.state == "error" and _is_billing_failure(payload):
+                    # A turn that runs out of credits reaches the user twice: the pump and the
+                    # stream consumer each post a proper notice about it, which is the channel
+                    # that can explain what to do. The tool list only needs to say the step
+                    # failed, so its detail is replaced rather than left to repeat the API's
+                    # billing text. The state is still set to error — leaving it at "running"
+                    # kept the spinner turning on a step that had already finished.
+                    line.summary = BILLING_SUMMARY
                 self.dirty_status = True
                 return
         # A result for a line we already folded away: nothing to update.
@@ -649,6 +678,25 @@ class Renderer:
         """Characters available for answer text: Telegram's full 4096 cap."""
         return config.TG_MESSAGE_LIMIT
 
+    def _send_form(self, html: str) -> str:
+        """The exact string to send for an already-built HTML fragment.
+
+        Normal mode returns it unchanged for ``parse_mode=HTML``. Degraded mode sends with
+        ``parse_mode=None``, so every escaped entity (``&amp;``, ``&lt;``) and any residual tag
+        would reach the user as literal text — which is exactly what filled the chat with
+        ``&lt;`` for the rest of a turn after a single parse rejection. Converting back to plain
+        text here is the other half of degrading: dropping the parse mode without un-escaping
+        only changed HOW the markup was broken, not whether it was.
+        """
+        return tg_html.plain(html) if self.degraded_html else html
+
+    async def _sleep(self, seconds: float) -> None:
+        """Stop-aware sleep, so a flood wait cannot delay shutdown by up to a minute."""
+        if self._stop is not None:
+            await _sleep_or_stop(self._stop, seconds)
+        else:
+            await asyncio.sleep(seconds)
+
     async def flush_notices(self) -> None:
         """Send bot-composed messages. These always start a new message.
 
@@ -665,12 +713,12 @@ class Renderer:
             if tg_html.display_length(raw) > self.body_limit:
                 head, _ = tg_html.split_message(raw, max(1, self.body_limit - 1))
                 raw = f"{head}…"
-            body = tg_html.render(raw)
+            body = self._send_form(tg_html.render(raw))
             await self.budget.acquire()
             try:
                 await self.sink.send_text(self.chat_id, body, parse_mode=self.parse_mode)
             except FloodWait as exc:
-                await asyncio.sleep(exc.retry_after + 0.1)
+                await self._sleep(exc.retry_after + 0.1)
                 return
             except ParseRejected:
                 self.degraded_html = True
@@ -681,6 +729,19 @@ class Renderer:
             except ChatGone:
                 self.fatal = True
                 return
+            except MessageTooLong:
+                # The split guard above should make this unreachable; if it is not, drop to a
+                # truncated plain-text notice so the queue keeps draining instead of wedging the
+                # conversation on a string that can never be accepted as-is.
+                log.error("over-cap notice on chat %s; truncating", self.chat_id)
+                fallback = tg_html.truncate(tg_html.plain(body), self.body_limit - 1)
+                await self.budget.acquire()
+                try:
+                    await self.sink.send_text(self.chat_id, fallback, parse_mode=None)
+                except (FloodWait, ParseRejected, MessageGone, ChatGone, MessageTooLong):
+                    return
+                self.notices.pop(0)
+                continue
             self.notices.pop(0)
 
     async def flush_status(self) -> None:
@@ -721,16 +782,17 @@ class Renderer:
             return
 
         await self.budget.acquire()
+        outbound = self._send_form(text)
         try:
             if self.status_msg_id is None:
-                self.status_msg_id = await self.sink.send_text(self.chat_id, text, parse_mode=self.parse_mode)
+                self.status_msg_id = await self.sink.send_text(self.chat_id, outbound, parse_mode=self.parse_mode)
             else:
-                await self.sink.edit_text(self.chat_id, self.status_msg_id, text, parse_mode=self.parse_mode)
+                await self.sink.edit_text(self.chat_id, self.status_msg_id, outbound, parse_mode=self.parse_mode)
             self.dirty_status = False
             self.last_status_ms = time.monotonic()
         except FloodWait as exc:
             # Leave dirty_status set; the loop retries on a later tick.
-            await asyncio.sleep(exc.retry_after + 0.1)
+            await self._sleep(exc.retry_after + 0.1)
         except ParseRejected:
             self.degraded_html = True
             self.dirty_status = True
@@ -771,7 +833,7 @@ class Renderer:
                 # rather than re-splitting to the same empty head on every tick forever.
                 head, tail = tail[:1], tail[1:]
             if head.strip():
-                if await self._write_live(tg_html.render(head)):
+                if await self._write_live(self._send_form(tg_html.render(head))):
                     # That message is now full and complete: it will never be edited again, so
                     # remember it as delivered and let the tail open a fresh one.
                     self.committed_text += head
@@ -790,7 +852,7 @@ class Renderer:
             self.last_text_ms = time.monotonic()
             return
 
-        self.dirty_text = not await self._write_live(tg_html.render(raw))
+        self.dirty_text = not await self._write_live(self._send_form(tg_html.render(raw)))
         self.last_text_ms = time.monotonic()
 
     async def _write_segment(self, text: str, msg_id: int | None) -> bool:
@@ -798,7 +860,7 @@ class Renderer:
         chunks = tg_html.split_all(text, self.body_limit) or [""]
         target = msg_id
         for chunk in chunks:
-            ok, _ = await self._write_raw(tg_html.render(chunk), target)
+            ok, _ = await self._write_raw(self._send_form(tg_html.render(chunk)), target)
             if not ok:
                 return False
             # Only the first chunk belongs in the message this segment streamed into;
@@ -828,7 +890,7 @@ class Renderer:
         except FloodWait as exc:
             # Sleep it out. Every write carries the full text, so waiting costs latency only.
             log.debug("flood wait %.1fs on chat %s", exc.retry_after, self.chat_id)
-            await asyncio.sleep(exc.retry_after + 0.1)
+            await self._sleep(exc.retry_after + 0.1)
             return False, msg_id
         except ParseRejected:
             self.degraded_html = True
@@ -850,6 +912,30 @@ class Renderer:
         except ChatGone:
             self.fatal = True
             return False, msg_id
+        except MessageTooLong:
+            # Defense in depth. The splitter is sized so a rendered head can never overflow (see
+            # tg_html._fence_reserve), but if an over-cap string ever reaches here, retrying it
+            # unchanged would wedge the chat: run() retains buffered content by design, so the
+            # identical send would fail forever. Fall back to a truncated plain-text message that
+            # always fits. For a live preview the authoritative buffered message replaces this on
+            # the next tick, so the truncation is self-healing; for a completed segment it loses
+            # the overflow, which still beats delivering nothing at all.
+            log.error(
+                "over-cap message on chat %s; sending a truncated plain-text fallback",
+                self.chat_id,
+            )
+            fallback = tg_html.truncate(tg_html.plain(text), self.body_limit - 1)
+            await self.budget.acquire()
+            try:
+                if msg_id is None:
+                    return True, await self.sink.send_text(
+                        self.chat_id, fallback, parse_mode=None
+                    )
+                await self.sink.edit_text(self.chat_id, msg_id, fallback, parse_mode=None)
+                return True, msg_id
+            except (FloodWait, ParseRejected, MessageGone, ChatGone, MessageTooLong) as exc:
+                log.debug("truncated fallback also failed: %s", exc)
+                return False, msg_id
 
     async def _safe_delete(self, message_id: int) -> None:
         try:
@@ -876,6 +962,7 @@ class Renderer:
 
     async def run(self, stop: asyncio.Event) -> None:
         """Consume frames and flush on a timer until stopped."""
+        self._stop = stop
         failures = 0
         while not stop.is_set() and not self.fatal:
             try:
@@ -952,6 +1039,16 @@ class Renderer:
         """
         if self.fatal:
             return
+        # Apply anything still queued before flushing. A notice posted by the same synchronous
+        # block that set ``stop`` — a conversation terminating, a session going — is sitting in
+        # the queue unapplied, and the flush below writes the ``notices`` list, not the queue.
+        # Without this the termination message, the one thing the user must see, could be dropped
+        # at exactly the moment it matters.
+        while not self.queue.empty():
+            try:
+                self.apply(self.queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
         try:
             if self.notices:
                 await self.flush_notices()
@@ -1003,14 +1100,24 @@ async def _run_hook(hook: Callable, args: tuple) -> None:
 
 
 def summarise_tool_input(name: str, raw: dict) -> str:
-    """One short line describing a tool call, for the status message."""
+    """One short line describing a tool call, for the status message.
+
+    Internal ids are scrubbed BEFORE truncation. Cutting first could slice an id mid-suffix, and
+    the shortened fragment would then fall below ``scrub_ids``' 12-character minimum and leak into
+    the status line unredacted — the truncation that was supposed to bound the line would have
+    defeated the redaction that was supposed to hide the id.
+    """
+
+    def clip(value: str) -> str:
+        return tg_html.truncate(tg_html.scrub_ids(value), config.TOOL_SUMMARY_CHARS)
+
     if not isinstance(raw, dict):
-        return tg_html.truncate(str(raw), config.TOOL_SUMMARY_CHARS)
+        return clip(str(raw))
 
     for key in ("command", "file_path", "pattern", "path", "query", "url", "prompt", "description"):
         value = raw.get(key)
         if isinstance(value, str) and value.strip():
-            return tg_html.truncate(value.strip().splitlines()[0], config.TOOL_SUMMARY_CHARS)
+            return clip(value.strip().splitlines()[0])
 
     if name == "DeliverArtifacts":
         names = [
@@ -1020,8 +1127,8 @@ def summarise_tool_input(name: str, raw: dict) -> str:
         ]
         names = [str(n) for n in names if n]
         if names:
-            return tg_html.truncate(", ".join(names), config.TOOL_SUMMARY_CHARS)
+            return clip(", ".join(names))
 
     if not raw:
         return ""
-    return tg_html.truncate(", ".join(sorted(raw.keys())), config.TOOL_SUMMARY_CHARS)
+    return clip(", ".join(sorted(raw.keys())))

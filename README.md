@@ -1,608 +1,291 @@
 # tgagent
 
-A Telegram remote control for Qoder Cloud Agents. Drive a full AI agent — code, research,
-PowerPoint generation, image generation, multi-file work — entirely from Telegram, with the
-backend running on an Android phone under Termux.
+A **Telegram remote control for Qoder Cloud Agents**. Drive a full AI agent — writing code,
+researching the web, building PowerPoint decks, generating images, reading files you send —
+entirely from a Telegram chat, with the bot itself running on an Android phone under Termux.
 
-**Why Cloud Agents rather than the Agent SDK:** the SDK spawns a local `qodercli` that
-executes tools on the host filesystem. That binary is glibc-linked and will not run on
-Termux (Android/bionic), and an SDK process dies the moment the phone dozes. Cloud Agents
-runs the agent loop server-side, so the phone only needs HTTPS + SSE, sessions keep running
-while the screen is off, and reconnecting replays missed events.
-
----
-
-## Phase 0 findings — verified API truth
-
-Everything below was observed empirically against the live API on 2026-09-07 with throwaway
-probe scripts that are no longer part of the tree. **Where this contradicts the published
-docs, trust this.**
-
-### 1. `agent.artifact_delivered` is a real, undocumented event
-
-The docs list no artifact event and never explain how `DeliverArtifacts` output reaches you.
-It arrives as a first-class event — use this, not poll-diffing `/files`:
-
-```json
-{
-  "type": "agent.artifact_delivered",
-  "id": "evt_...",
-  "file_id": "file_...",
-  "original_filename": "deck.pptx",
-  "size": 30097,
-  "content_type": "application/octet-stream",
-  "processed_at": "2026-09-07T18:59:46.679111Z"
-}
-```
-
-Note `content_type` is often a useless `application/octet-stream`; trust `original_filename`
-for the extension instead.
-
-### 2. `GET /files/{id}/content` returns a JSON envelope, NOT bytes
-
-This is the single most surprising finding. It returns a short-lived pre-signed URL:
-
-```json
-{"expires_at": "2026-09-07T19:59:51Z", "url": "https://qoder-cloud-agents-storage-sg.oss-ap-southeast-1.aliyuncs.com/files%2F..."}
-```
-
-Downloading an artifact is therefore **three** steps:
-
-1. read `file_id` from `agent.artifact_delivered`
-2. `GET /api/v1/cloud/files/{file_id}/content` → parse `{expires_at, url}`
-3. `GET url` (follow redirects) → the real bytes
-
-The URL expires roughly **one hour** after issue, so fetch it immediately; never cache it.
-`403` means `downloadable:false` (agent-internal file).
-
-### 3. Binary uploads work — the API reference page is stale
-
-`POST /files` accepts png, zip, pptx and text alike. The reference page still says "Only
-text-based files are accepted. Binary document, image, audio, video, and archive files are
-rejected"; the July 2026 release notes are correct. Uploaded inputs come back with
-`downloadable: false` (they are inputs, not outputs).
-
-### 4. `POST /sessions/{id}/resources` takes a BARE object
-
-Not a `{"resources": [...]}` wrapper — that returns
-`400 unknown field "resources"`. Correct body:
-
-```json
-{"type": "file", "file_id": "file_...", "mount_path": "/data/workspace/uploads/x.png"}
-```
-
-Response includes `id` (`sesr_...`) and the resolved `mount_path`. Omitting `mount_path`
-defaults to `/mnt/session/uploads/<file_id>`. This endpoint accepts **only** `type:"file"`;
-`memory_store`, `github_repository` and `git_repository` must be attached in the `resources`
-array at session **creation** time.
-
-### 5. `user.message` content blocks: only `text` and `image`
-
-The API says so explicitly: `content[1].type "file" is not supported. Allowed: text, image.`
-An `image` block does **not** accept `file_id` (`unknown field "file_id"`). The working shape
-is inline base64:
-
-```json
-{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "<b64>"}}
-```
-
-**But prefer mount + `Read` over base64.** The `Read` tool decodes images natively:
-
-```
-Read image: /data/workspace/uploads/vision_target.png
-Original: 64x32, 108 B, .png
-Returned: 64x32, 108 B, image/png, kept original
-```
-
-A model asked about a mounted 64×32 solid-blue PNG answered "64×32 pixels and is solid blue"
-— real vision, for 0.03 credits. Mounting avoids base64's ~33% inflation against the 4 MB
-request-body cap and avoids paying image tokens on every subsequent turn. Use inline base64
-only when a file must appear in the message itself.
-
-### 6. Events are FLAT, not `content[]`-wrapped
-
-Observed top-level keys per type:
-
-| type | top-level keys |
-|---|---|
-| `agent.tool_use` | `id, type, name, input, evaluated_permission, processed_at` |
-| `agent.tool_result` | `id, type, tool_use_id, is_error, content[], processed_at` |
-| `agent.message` | `id, type, content[], processed_at` |
-| `agent.thinking` | `id, type, processed_at` (content may be absent) |
-| `agent.artifact_delivered` | `id, type, file_id, original_filename, size, content_type, processed_at` |
-| `span.model_request_end` | `id, type, is_error, model_request_start_id, model_usage, processed_at` |
-| `session.status_idle` | `id, type, stop_reason, processed_at` |
-| `session.thread_status_*` | `id, type, agent_name, session_thread_id, processed_at` |
-
-So `tool_use.name` and `tool_use.input` are **top-level**, while `message`/`tool_result`
-carry `content: [{"type":"text","text":...}]`.
-
-`session.thread_status_running` / `_idle` appear even for a single-agent session (there is
-always a default coordinator thread, `sthr_...`). Ignore them.
-
-### 7. Incremental streaming shapes
-
-Opt in with `?event_deltas[]=agent.message&event_deltas[]=agent.thinking`. The SSE `event:`
-field is literally `event_start` / `event_delta`, and `id:` is the event id:
-
-```json
-{"type":"event_start","event":{"id":"evt_...","type":"agent.message"}}
-{"type":"event_delta","event_id":"evt_...","delta":{"type":"content_delta","index":0,"content":{"type":"text","text":"1\n2\n3"}}}
-```
-
-Deltas arrive in **chunks, not per token** (6 delta frames for a 40-line reply). The final
-buffered `agent.message` is authoritative — replace the accumulated text with it rather than
-trusting the deltas to be complete.
-
-### 8. `Last-Event-ID` resume
-
-- Valid id → `HTTP 200`, replays every event **after** that id, in order.
-- Unknown id → `HTTP 404` `not_found_error` "Event '...' was not found."
-- Malformed id → also `404`, not `400`.
-
-So reconciliation must treat `404` as "cursor is stale, rebuild from `GET /events`".
-
-### 9. Credits are per model request — SUM them per turn
-
-One turn emits several `span.model_request_end` events. The PPT turn cost
-`6.66 + 0.96 + 0.59 = 8.21` credits. Never read a single span as the turn cost.
-
-### 10. Model catalog (18 models, live)
-
-Re-read on **2026-09-13**: 18 models. The table below omits `available_context_windows` and
-`default_context_window`; section 12 explains why those matter and cannot be guessed.
-
-| id | name | price | vision | max input |
-|---|---|---|---|---|
-| `lite` | Lite | **0** | no | 200 000 |
-| `qmodel` | Qwen3.7-Plus | **0.04** | yes | 1 000 000 |
-| `qfmodel` | Qwen3.8-Flash | 0.04 | yes | 180 000 |
-| `gfmodel` | GLM-5.3-Flash | 0.1 | yes | 1 000 000 |
-| `qmodel_latest` | Qwen3.7-Max | 0.1 | yes | 1 000 000 |
-| `qmodel_38max` | Qwen3.8-Max | 0.2 | yes | 180 000 |
-| `mmodel` | MiniMax-M3 | 0.2 | yes | 1 000 000 |
-| `dfmodel` | DeepSeek-Flash | 0.2 | yes | 1 000 000 |
-| `efficient` | Efficient | 0.3 | yes | 200 000 |
-| `kmodel` | Kimi-K2.8-Preview | 0.3 | yes | — |
-| `gmodel` | GLM-5.3 | 0.6 | yes | 180 000 |
-| `dmodel` | DeepSeek-V4-Pro | 0.8 | yes | 1 000 000 |
-| `kmodel_latest` | Kimi-K3 | 0.8 | yes | 180 000 |
-| `auto` | Auto | 1.0 | yes | 200 000 |
-| `performance` | Performance | 1.1 | yes | 1 000 000 |
-| `ultimate` | Ultimate | 1.6 | yes | 1 000 000 |
-| `cmodel` | Cantus | 3.2 | yes | 180 000 |
-| `smodel` | Sonus | 3.2 | yes | 180 000 |
-
-> **Drift since the 2026-09-10 capture**, which is the reason `pick_model` resolves against the
-> live catalog rather than a table like this one: `smodel` (Sonus) was missing from the table
-> entirely; `gfmodel` repriced 0.05 → **0.1**; `dfmodel` was renamed DeepSeek-V4-Flash →
-> **DeepSeek-Flash** and repriced 0.3 → **0.2**; `kmodel` was renamed Kimi-K2.7-Code →
-> **Kimi-K2.8-Preview** and now reports **no `max_input_tokens` at all**. Vision is the `is_vl`
-> flag. Treat every figure here as a snapshot, not a contract.
-
-**Default is `qmodel_38max`** (Qwen3.8-Max) — vision-capable, price factor 0.2, and unlike
-`qmodel` it advertises effort levels (`low` / `medium` / `xhigh`), so `/effort` can bring it down
-from its `xhigh` default. Given that effort multiplies the real cost of every request (section
-14), being tunable is worth more than the cheaper factor: `qmodel` (Qwen3.7-Plus, 0.04, 1M-token
-window) costs less per token but advertises no `efforts` at all and so cannot be tuned.
-Measured: the same style of turn cost **8.21 credits on `ultimate`** (effort `low`) versus
-**0.03 credits on `qmodel`**.
-
-> **Correction, 2026-09-13.** That 0.03 is an outlier, not a baseline, and `price_factor` cannot
-> be used to predict what a turn costs. The billing docs put a simple question at **1–3 credits**,
-> routine document generation at 10–15, and a complex multi-turn tool task at 20–50; credits
-> scale with model, task complexity, context length and tool use, with `price_factor` only a
-> "relative multiplier". Measured on `qmodel`: `"hello how are you?"` cost **2.99** credits in
-> one session and **0.31** for a byte-identical exchange in another. See section 14 for the
-> larger lever, `model.effort`.
-
-`/model` switches **per user**, not per conversation. A session takes its model from its
-agent and the API offers no per-session override, so the bot provisions one agent per
-Telegram user (`tgagent-user-<id>`) and `/model <id>` updates only that user's agent, with
-`PUT` and a `context_window` taken from that model's catalog entry (see section 12). It takes
-effect from their next `/new`; a session already created keeps the model it started with.
-This is also why a shared agent would not do: one user switching to `ultimate` would silently
-change what everyone else's sessions run on.
-
-`lite` is free but has no vision, so it cannot see uploaded images.
-
-### 11. Confirmed working request shapes
-
-Agent with explicit permissions (`evaluated_permission: "allow"` was observed on every tool
-call, so this shape is accepted and effective):
-
-```json
-{
-  "name": "kebab-case-name",
-  "model": {"id": "qmodel", "context_window": 200000},
-  "system": "...",
-  "tools": [{
-    "type": "agent_toolset_20260401",
-    "enabled_tools": ["Bash", "Read", "Write", "Edit", "Glob", "Grep",
-                      "WebFetch", "WebSearch", "ImageSearch", "ImageGen", "DeliverArtifacts"],
-    "configs": [{"name": "Bash", "permission_policy": {"type": "always_allow"}}]
-  }]
-}
-```
-
-`model` also accepts a bare string, and an optional `effort` where the model lists `efforts`.
-Environment with dependencies:
-
-```json
-{"name": "...", "config": {"type": "cloud", "packages": {"pip": ["python-pptx"]},
-  "setup_script": "set -euo pipefail\nmkdir -p /data/workspace\n"}}
-```
-
-Session: `{"agent": "<agent_id>", "environment_id": "<env_id>"}` → `status: "idle"`.
-Turn: `POST /sessions/{id}/events` with `{"events": [{"type":"user.message","content":[{"type":"text","text":"..."}]}]}`.
-Cancel: `POST /sessions/{id}/cancel` → `{"status": "canceling"}`.
-History: `GET /sessions/{id}/events?order=asc&limit=100&after_id=<evt>` → `{data, has_more}`.
+You message a bot. Behind it, a sandboxed agent with Bash, file tools, web access and image
+generation does the work and streams the result back into the chat. Conversations persist, files
+cross both ways, and if the cloud session is ever lost the bot rebuilds it from the transcript it
+keeps on its own device.
 
 ---
 
-### 12. Agents are updated with PUT, and `context_window` is not a free number
+## Features
 
-Verified against the live API on 2026-09-10. Neither fact is in the docs, and both are needed
-before `/model` can work at all.
+- **A real agent, not a chatbot** — code, multi-file work, web research, `.pptx`/`.pdf`/image
+  generation, delivered back to you as files.
+- **Runs on a phone** — the backend needs only HTTPS + SSE, so it lives on an Android device
+  under Termux and keeps working while the screen is off.
+- **Live streaming** — answers type into the Telegram message as they are produced, with a
+  collapsible tool-activity view.
+- **Two-way files** — send a document or photo and the agent reads it (images included, via real
+  vision); files it produces come back to the chat.
+- **Multiple conversations** — per user, per group, and per forum topic; switch between them with
+  inline buttons.
+- **Per-user model & cost control** — pick the model and reasoning effort, with a credit budget
+  and spend ledger per user.
+- **Crash- and rotation-resilient** — survives Android killing the process, and rebuilds a
+  conversation from its on-device transcript when its cloud session disappears.
+- **Administer it from Telegram** — manage the allowlist and rotate the API token live, no restart.
 
-`OPTIONS /agents/{id}` returns `Allow: GET, POST, PUT, DELETE`. **There is no PATCH** — it
-answers `405`. `PUT` replaces the whole object, so an update has to read the agent back and
-re-send the complete definition with only the model changed; sending `{"model": ...}` alone
-would drop the system prompt and every tool permission. Agents use optimistic concurrency: a
-stale `version` in the body returns `409 Version conflict. Expected version 1, got 2.`, and a
-successful PUT increments it.
+---
 
-`model.context_window` must be one of that model's own `available_context_windows` from
-`GET /models`. Anything else is rejected:
+## How it works
 
+**Why Cloud Agents rather than the Agent SDK:** the SDK spawns a local `qodercli` that executes
+tools on the host filesystem. That binary is glibc-linked and will not run on Termux
+(Android/bionic), and an SDK process dies the moment the phone dozes. Cloud Agents runs the agent
+loop server-side, so the phone only needs HTTPS + SSE, sessions keep running while the screen is
+off, and reconnecting replays missed events.
+
+```mermaid
+flowchart TD
+    U["Telegram user"] -->|"update"| H["handlers.py — auth gate &amp; commands"]
+    H --> M["Manager — registry, provisioning, reconcile"]
+    M --> C["Conversation — queue / pump / consume / render loops"]
+    C -->|"POST events"| Q[("Qoder Cloud Agents<br/>server-side agent loop")]
+    Q -->|"SSE stream (or poll fallback)"| C
+    C --> R["Renderer → TelegramSink"]
+    R -->|"streamed HTML messages"| U
+    C --> A["ArtifactDeliverer"]
+    M -.-> DB[("SQLite — conversations, transcripts,<br/>queue, credit ledger, access, token")]
+    C -.-> DB
+    A -.-> FC[("filecache/ — retained files")]
 ```
-400 Field 'model.context_window' is not supported by model 'gmodel'.
-```
 
-The catalog splits three ways, so the field cannot be hardcoded:
+Each Qoder account holds five kinds of remote resource. Only a **session** runs anything or holds
+files; the rest are definitions the bot provisions once and caches locally:
 
-| models | catalog fields | what to send |
+| resource | how many | what it is |
 |---|---|---|
-| 16 of 18 — `qmodel`, `gmodel`, `ultimate`, `qmodel_38max`, `kmodel`, … | `default_context_window: 200000`, `available_context_windows: [200000, 400000, 1000000]` | `200000`, which is also the platform default |
-| `performance` | `default_context_window: 272000`, `available_context_windows: [272000, 400000, 1000000]` | **272000** — 200000 is not offered, so `model_ref` falls through to the model's own default |
-| `lite`, `auto`, `efficient` | no window fields at all | **omit `context_window`** |
+| environment | 1, shared | A container *template* (packages, setup script). Not an isolation boundary. |
+| agent | 1 per user | Model, system prompt and tool permissions. A session inherits all three. |
+| memory store | 1 per user | Long-term notes, mounted read/write into the sandbox. |
+| session | 1 per conversation | The actual sandbox — where Bash runs and files live. |
+| file | per upload / artifact | Account-global object storage. |
 
-> **Correction, 2026-09-13.** This table used to single out `kmodel` as offering
-> `available_context_windows: [256000]` only, with 200000 refused by a 400. That was true when it
-> was observed — the catalog has since moved, and `kmodel` now advertises the standard
-> `[200000, 400000, 1000000]`. The lesson survives the specific row: the tiers are per-model and
-> do change underneath us, which is exactly why `model_ref` derives the value from the catalog
-> entry and gates it against `available_context_windows` instead of sending a constant.
-
-`DEFAULT_CONTEXT_WINDOW = 200000` in config is therefore a **cost ceiling, not a guess at the
-default**. On today's catalog it coincides with every model's `default_context_window`, so
-preferring it changes nothing — but if a model ever shipped offering
-`[200000, 400000, 1000000]` with `default_context_window: 400000`, preferring the constant holds
-the session at the cheap tier where preferring the default would silently double the window. A
-larger window is not free: compaction (section 15) is what keeps each request's input small, and a
-bigger window means the runtime accumulates more history before compacting.
-
-`tgagent.qsessions.model_ref` derives it from the catalog entry. `DELETE /agents/{id}` works
-and returns `{"deleted": true}`; nothing in the bot calls it.
+> The exact per-command cost, the resource lifecycle and the deletion policy are in
+> **[docs/INTERNALS.md](docs/INTERNALS.md)**.
 
 ---
 
-### 13. No reasoning text — `/think` removed
+## Quickstart
 
-Verified against the live Qoder Cloud Agents platform on 2026-09-10: despite emitting an
-`agent.thinking` event marker, **no reasoning text arrives** at all. Across qmodel_38max, dfmodel,
-gmodel and ultimate (with explicit `effort` setting), every probe shows:
+Requires **Python 3.10+**.
 
-- **1** `event_start(agent.thinking)` frame per turn
-- **0** `event_delta` frames carrying thinking content (zero chars accumulated)
-- **1** buffered `agent.thinking` event with keys `['id','processed_at','type']` — **no `content` field**
+```bash
+git clone <your-fork-or-repo-url> tgagent && cd tgagent
+python3 -m venv .venv
+.venv/bin/pip install -e .
 
-The framework used to build a “reasoning display” toggle (`/think`) was therefore removed entirely.
-A command that could only ever say "nothing to show" was worse than hiding it: leaving it in the
-command menu would invite users to tap it again and again. See Section 10 for the model list
-(`qmodel_38max` is the default: vision-capable, 0.2 against `ultimate`'s 1.6, and tunable with
-`/effort` — see Section 14) and Section 12 for how models are updated via `PUT /agents/{id}`
-rather than the non-existent `PATCH`.
-
-**The marker is still worth rendering, though** (added 2026-09-13). `event_start(agent.thinking)`
-is the only *live* signal that reasoning is happening — the buffered event lands after the phase
-has ended, which is useless as an indicator. `Renderer` now uses it to show a `thinking…` status
-line and retracts it the moment the answer's own `event_start(agent.message)` arrives, plus on a
-tool call, a platform retry, and every turn-ending status.
-
-That fills a real hole rather than adding decoration. `flush_status` retracts a status message
-whose only content is filler, which is why `"working…"` never reaches the chat — so a turn that
-reasons for a minute without calling a single tool used to render as **nothing at all** until the
-answer landed. It is gated on the same `/tools` preference as the tool list, because it is the same
-kind of thing: activity feedback. (The compaction banner in section 15 deliberately is not — that
-reports conversation state, not something the agent did.)
-
-**Fixing that exposed a worse bug behind the same gate.** The retraction used to be
-`if not self.tool_lines or not text` — *no tool lines, retract* — which meant every informative
-status line was swallowed on any turn that called no tools. That includes `session.error`'s
-`⚠ <type>: <message>`, `session.status_rescheduled`'s retry notice, `_idle_status`'s
-`stopped (retries_exhausted)`, `waiting for approval`, and `session ended`. `convo._on_error` and
-`_on_terminated` post no notice of their own — they only set internal state and wake the pump — so
-the status message was the **only** channel that information had. Net effect: on a plain
-question-and-answer turn with no tools, an API error was completely invisible. The user saw their
-message go in and nothing come back.
-
-The rule is now inverted. `QUIET_STATUS_LINES` names the only two lines that are pure filler
-(`STATUS_WORKING`, `STATUS_DONE`) and everything else justifies a message of its own via
-`Renderer.status_worth_a_message`. Inverted on purpose: a new status line now defaults to being
-shown, where the old default silently hid it. Both constants exist because `flush_status` branches
-on the values, and a literal retyped at one of the four assignment sites would quietly reintroduce
-the bug. This also means `/tools` off no longer hides failures — hiding tool activity is not a
-request to be told nothing when a turn dies.
-
-`qclient` had been requesting `event_deltas[]=agent.thinking` since Phase 0 and discarding the
-frame in `_apply_delta`; the parameter is now load-bearing. There is still no reasoning *text*, so
-`/think` stays removed and `users.show_thinking` stays vestigial.
-
----
-
-### 14. `model.effort` — the cost lever the catalog hides
-
-Verified against the live API on 2026-09-13. `effort` is an optional field of the Agent `model`
-object, but what actually decides the cost when you omit it is each model's `default_effort` —
-and that is not the cheap end:
-
-| `default_effort` | models |
-|---|---|
-| `max` | `gmodel`, `gfmodel`, `dfmodel`, `kmodel`, `kmodel_latest`, `dmodel` |
-| `xhigh` | `qfmodel`, `qmodel_38max` |
-| `high` | `smodel`, `cmodel`, `ultimate` |
-| `medium` | `performance` |
-| *none — not adjustable* | `lite`, `qmodel`, `qmodel_latest`, `mmodel`, `efficient`, `auto` |
-
-Ten of eighteen therefore run at `max`, `xhigh` or `high` unless the agent says otherwise, which
-moves real cost far more than `price_factor` does: `gmodel` is only 0.6× but defaults to `max`.
-
-The API validates effort two different ways, both observed:
-
-```
-{"id":"gmodel","effort":"low"}     -> 200, stored as {"context_window":200000,"effort":"low","id":"gmodel"}
-{"id":"gmodel","effort":"medium"}  -> 400 Field 'model.effort' is not supported by model 'gmodel'.
-{"id":"gmodel","effort":"turbo"}   -> 400 Field 'model.effort' must be one of: none, low, medium, high, xhigh, max.
-{"id":"qmodel","effort":"low"}     -> 400 Field 'model.effort' is not supported by model 'qmodel'.
+cp .env.example .env       # then edit .env
+chmod 600 .env
+.venv/bin/python -m tgagent
 ```
 
-The middle two are the important pair. `medium` is a *valid level* that `gmodel` simply does not
-offer — its `efforts` are `low`/`high`/`max` — while `qmodel` advertises no `efforts` at all and
-rejects every level. So the only authoritative list is each model's own `efforts` array; the
-global level list is not sufficient to validate against.
+Fill in three values in `.env` to start: `QODER_PAT`, `TG_BOT_TOKEN`, and `TG_ADMIN_ID` (your own
+Telegram user id — see below). Every other variable has a working default.
 
-That makes the gate in `tgagent.qsessions.model_ref` load-bearing rather than cosmetic. Effort
-is a stored per-user preference that OUTLIVES a model switch, so replaying it blindly would send
-`effort:"low"` to `qmodel` at the next provisioning and 400 — failing conversation creation
-outright, not just the model change. `model_ref` drops any level the target model does not
-advertise, quietly returning it to its own default.
+**Finding your Telegram user id.** Leave `TG_ADMIN_ID` and `TG_ALLOWED_IDS` empty and start the
+bot. In this "discovery mode" it admits nobody, but replies to anyone who messages it with that
+person's numeric id (at most once a minute). Put your id in `TG_ADMIN_ID`, restart, and you are the
+administrator. `/start` re-shows your id at any time.
 
-`/effort` shows and sets it, validated against the current model's `efforts`; `/model` lists each
-model's `default_effort` beside its price. Both take effect from the next `/new`, because a
-session keeps the configuration it was created with — `GET /sessions/{id}` embeds the agent
-including `model.effort` and a read-only `effective_context_window`, which is what `/health`
-reads to report the model actually running.
+**On Termux (Android):** run `deploy/termux_setup.sh`, then start the bot under `tmux` with a
+`termux-wakelock` so Android does not freeze it. `deploy/run.sh` and the `Termux:Boot` script share
+`logs/tgagent.pid` and refuse to launch a second instance — two pollers on one token fight over the
+same update queue and both lose messages. A stale pid file is cleared automatically.
 
----
-
-### 15. Context overflow is auto-compacted server-side, and the event is barely documented
-
-Researched 2026-09-13. When a session's history outgrows its `context_window` (section 12), the
-platform **compacts it itself**: earlier detail is replaced by a denser summary and the turn
-continues. It is not an error, not a truncation, and not a `session.error`.
-
-The client has **no control over it**. `POST /sessions/{id}/events` accepts exactly seven client
-event types — `user.message`, `user.interrupt`, `user.tool_confirmation`, `user.tool_result`,
-`user.custom_tool_result`, `user.define_outcome`, `system.message` — so there is no `/compact`
-equivalent, no threshold to set, and no way to opt out. `effective_context_window` on a session is
-response-only and the docs call it "informational".
-
-The evidence that compaction happens at all is one entry in one list. `agent.thread_context_compacted`
-appears among the public event types in the Session schemas page, and **nowhere else**: the SSE
-Event Stream page does not mention it, the multiagent thread-event table does not, and the webhook
-catalog does not include it. So its payload fields, its trigger threshold and its exact semantics
-are all undocumented. The mechanism is described only on the IDE-facing *Context compaction* page,
-which covers the same runtime: "Qoder can also compact automatically when the runtime needs more
-room", "Compaction does not delete the task history; it prepares a denser summary for later
-requests", and "**Compaction is lossy by design.**"
-
-What the bot does with it, in `Renderer.apply`: logs at INFO and raises a `⟲ context compacted —
-earlier detail was summarised` banner in that turn's status message. Three deliberate choices:
-
-- **Nothing is read from the payload.** With no schema, guessing at fields would be inventing
-  behaviour; the event type alone is the signal.
-- **A banner, not a `status_line`.** `status_line` is overwritten by the next tool call and again
-  by the idle transition, so a compaction landing early in a turn would have vanished before the
-  answer arrived. Its own field keeps it on screen for the rest of the turn, and the next
-  `session.status_running` clears it — each turn still gets its own status message.
-- **Not gated on `/tools`**, unlike the `thinking…` marker in section 13. Hiding tool activity is
-  not a request to be kept ignorant of a lossy change to conversation state.
-
-Before this the event fell through `apply`'s catch-all *and* `history.record_frame`'s, so a
-compacted session was invisible in the chat **and** in the logs — "it forgot what I said earlier"
-would have been undiagnosable. It is still not recorded in the local transcript: it carries no
-content, and the transcript is what gets replayed into a resumed session.
-
-Acknowledgement is safe without any new code. `qstream.DEFERRED_ACK_TYPES` is exactly
-`{"agent.message"}`, so every other event type — this one included — is acked at `offer` and cannot
-stall the durable cursor behind it.
-
-**Not verified:** this has never been observed firing against a live session, so the banner's
-actual appearance and cadence are untested in production. The harness covers the rendering; the
-platform side is inference from the event's name and the IDE docs.
-
-Do not confuse this with `HISTORY_MAX_EVENTS` / `HISTORY_CONTEXT_BUDGET`, which bound the *local*
-transcript injected when a lost session is rebuilt. They have no effect on a cloud session's
-context.
+There is no separate smoke test: the bot provisions its own environment on first start, and each
+user's agent and memory store on their first conversation. `/health` reports what is connected.
 
 ---
 
-## What lives in the Qoder account
+## Configuration
 
-Four kinds of remote resource, created at four different moments. Only a **session** runs
-anything or holds files; the other three are definitions.
+All configuration is environment variables, read from `.env` and then overridden by any real
+environment variable (so Termux can override without editing the file). `.env.example` documents
+every one; a key left blank after its `=` is treated as unset, not as an empty value.
 
-| resource | how many | created when | what it is |
-|---|---|---|---|
-| environment | 1, shared | first boot | A *template*: container config, pip packages, setup script. No filesystem, no state. Not an isolation boundary. |
-| agent | 1 per user | that user's first conversation | A *definition*: model, system prompt, tools and their permissions. A session inherits all three from it. |
-| memory store | 1 per user | that user's first conversation | Long-term notes, mounted read/write at `/data/.qoder/awareness/`. |
-| session | 1 per conversation | `/new`, or the first message with no active conversation | The actual sandbox. This is where Bash runs and `/data/workspace` lives. |
-| file | per upload / per artifact | on demand | Account-global object storage, listed with `scope_id` as a filter. |
-
-Per-event cost:
-
-* `/start`, `/help`, `/model`, `/effort`, `/tools`, `/files`, `/usage`, `/health`, `/sessions` —
-  **no** new remote resources. `/model` and `/effort` `PUT` the user's existing agent (there is
-  no `PATCH` — see section 12); if they have none yet the choice is stored locally and applied
-  when their first agent is created. `/sessions` reads only the local database, which is why it can also offer ⟳ RESTORE
-  for a conversation whose cloud session is gone.
-* `/archive` — one `POST /sessions/{id}/archive`, which closes the sandbox. Nothing is deleted.
-* A stranger messages the bot — nothing is created, remotely or locally. They are rejected by
-  the allowlist. With an empty allowlist (first-run discovery) they get their own user id back
-  and still nothing is created.
-* `/new` — one new **session**. On a user's very first conversation, also one **agent** and one
-  **memory store**.
-* An ordinary message in an existing conversation — no new resources; it posts an event to the
-  session that already exists.
-* A boot after Android killed the process — `GET` for the environment and the model catalog,
-  then one `GET /sessions/{id}` per conversation worth reconciling, four at a time. "Worth
-  reconciling" means the conversation the user is currently addressing, plus any that were
-  mid-turn when the process died. Everything else is picked up lazily when the user switches
-  back to it, so boot cost does not grow with the number of conversations ever created.
-
-Nothing is ever deleted remotely, and nothing is auto-archived for being idle. Only the
-sandbox *filesystem* is reclaimed after 24 hours of inactivity; the session itself keeps its
-whole conversation history server-side, so an old conversation is still worth returning to.
-Archiving closes a sandbox; environments, agents and memory stores persist until removed from
-the console. Renaming `ENV_NAME` or the agent prefix therefore orphans the old resource in the
-account — the bot forgets the stale local row and logs the orphaned id, but leaves the remote
-resource alone, because deleting it is irreversible and affects an account other code may use.
+| variable | default | meaning |
+|---|---|---|
+| `QODER_PAT` | — *(required)* | Bootstrap Qoder Personal Access Token. Bills real credits. Overridden at runtime once you `/setpat`. |
+| `TG_BOT_TOKEN` | — *(required)* | Bot token from @BotFather. Anyone holding it can impersonate the bot. |
+| `TG_ADMIN_ID` | *(none)* | The single administrator's Telegram user id. Root of trust; fixed at deploy. |
+| `TG_ALLOWED_IDS` | *(empty)* | Seed allowlist of user ids. The database copy takes over after the first `/allow` or `/disallow`. |
+| `QODER_API_BASE` | `https://api.qoder.com` | API origin. |
+| `TGAGENT_MODEL` | `qmodel_38max` | Model seeded into each new user. `/model` lists what the account offers. |
+| `TGAGENT_EFFORT` | *(model default)* | Reasoning effort seeded into new users: `none`/`low`/`medium`/`high`/`xhigh`/`max`. |
+| `MAX_LIVE_STREAMS` | `4` | Concurrent live SSE connections; beyond this, conversations poll instead. |
+| `CREDIT_BUDGET` | `1000` | Per-user monthly credit budget. Warns at 80%, never blocks. `0` = no cap. |
+| `BURST_DEBOUNCE_S` | `6.0` | Quiet period after your last message before a turn is dispatched. `0` = send each line separately. |
+| `TGAGENT_LOG` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR`. |
+| `TGAGENT_DB` | `<project>/tgagent.db` | SQLite path — must not live in scratch space. |
+| `TGAGENT_FILECACHE` | `<project>/filecache` | Retained file copies, used to re-upload attachments on resume. |
 
 ---
 
-## Rotating the PAT, or moving to another account
+## Commands
 
-A session belongs to the credential that created it. Point the bot at a new PAT — a rotated
-token, or a different Qoder account entirely — and every session the old one created returns
-`404`. Nothing else about the account is reusable either: the environment, the per-user agents
-and the memory stores all have to exist again under the new credential.
+### For everyone
 
-This is a supported transition, not a failure. What the bot does:
-
-* **Nothing is treated as deleted.** `reconcile` retires an unreachable conversation with
-  `lost_session = 1` rather than `deleted_at` alone, which is the flag that separates "the
-  credential changed under me" from "the user pressed /archive". Only a lost conversation is
-  offered back.
-* **The account is re-provisioned lazily.** The environment on the next boot, and each user's
-  agent and memory store on their next conversation. A cached id that 404s is forgotten and
-  recreated; an id that merely failed to validate on a flaky link is kept, because minting a
-  duplicate on every unstable boot is how an account fills up with orphans.
-* **The conversation is rebuilt from the on-device transcript**, on a fresh session, with the
-  memory store attached exactly as a brand-new conversation would have it.
-
-Three things can trigger that rebuild, and all three behave the same way:
-
-| trigger | where |
+| command | what it does |
 |---|---|
-| boot reconcile, then the user's next message | `Manager.reconcile` → `handlers._active` |
-| the stream or the poll fallback sees the session 404 | `StreamConsumer.run` / `Conversation._poll_history` |
-| a dispatch to the dead session returns 404 | `Conversation._dispatch_burst` |
+| `/start` | Your user id (at most once an hour) plus help text |
+| `/help` | Commands and capabilities |
+| `/new` | Start a fresh conversation |
+| `/sessions` (or `/switch`) | Switch between your conversations, or restore a lost one |
+| `/stop` | Cancel the turn in progress |
+| `/model` | List models; `/model <id>` to switch (takes effect from your next `/new`) |
+| `/effort` | Reasoning effort; `/effort low` costs far less than `max` |
+| `/tools` | Show or hide the tool-activity message |
+| `/files` | Files sent and produced in this conversation |
+| `/usage` | Your credit spend |
+| `/archive` | Close this conversation |
+| `/health` | Is everything connected? Shows the loaded token's fingerprint |
 
-Whichever fires, anything still sitting in that conversation's durable inbound queue is carried
-across and re-queued behind the transcript. That matters most for the third case: the message
-that *revealed* the dead session is the one already in the queue, and dropping it would mean
-the user watches an error and then has to retype what they said.
+Just send a message (optionally with a document or photo) and the agent goes to work.
 
-What survives, and what does not:
+### For the administrator
 
-* **Survives** — the newest `HISTORY_CONTEXT_BUDGET` characters of the transcript, and any file
-  whose copy is still in `filecache/`, re-uploaded and re-mounted into the new sandbox.
-* **Does not survive** — the old sandbox filesystem (a new session is a new sandbox), and the
-  old account's server-side session history, which the new credential cannot see at all.
+These are gated on `TG_ADMIN_ID` and are deliberately not shown in the public command menu. Send
+`/admin` in the chat to list them.
 
-The rebuild is capped at `AUTO_RESUME_MAX_ATTEMPTS` per chat per process life. A session that
-vanishes again immediately after being created is not something another rebuild will fix, and
-an uncapped loop would mint a paid session every few seconds.
+| command | what it does |
+|---|---|
+| `/admin` | List the administrator commands |
+| `/allow <id>` | Permit a user id — takes effect immediately, no restart |
+| `/disallow <id>` | Revoke a user id |
+| `/allowed` (or `/allowlist`) | Show the admin id and the current allowlist |
+| `/setpat <token>` | Validate and hot-swap the Qoder API token |
 
-`/health` shows a non-reversible fingerprint of the loaded credential — so you can tell at a
-glance which token the bot is holding — and how many conversations are awaiting a ⟳ RESTORE.
-Resources left behind in the old account are never deleted remotely; they are forgotten locally
-and logged, because deleting them is irreversible and affects an account other code may use.
+---
+
+## Access & administration
+
+Access has two layers:
+
+- **The administrator** (`TG_ADMIN_ID`) — exactly one user, fixed at deploy time and **not**
+  changeable at runtime, because it is the root of trust: whoever holds it can change the
+  allowlist and rotate the API token. Telegram's Bot API offers no way to discover who owns a bot,
+  so you name your own id. The admin is always allowed, whether or not they are on the allowlist.
+- **The allowlist** — everyone else permitted to use the bot. Seeded from `TG_ALLOWED_IDS`, then
+  managed live from Telegram with `/allow` and `/disallow`.
+
+A stranger who messages the bot is refused and told their own user id (so they can pass it to you),
+at most once a minute — the throttle stops anyone who finds the bot from making it burn its
+Telegram send budget.
+
+**Changes persist.** Once you use `/allow` or `/disallow`, the allowlist is stored in the bot's
+database and that copy overrides the `TG_ALLOWED_IDS` seed on later boots — so a removal survives a
+restart instead of being silently re-added from `.env`.
+
+### Rotating the API token live (`/setpat`)
+
+`/setpat <token>` swaps the Qoder credential **without a restart**:
+
+1. The token is **validated first** against the API; a bad token changes nothing.
+2. The backend is rebuilt on the new token — API client, manager, environment provisioning — and
+   the bot reconciles.
+3. Every session the *old* token created now returns `404`, so those conversations are marked
+   *lost* and rebuild themselves from the on-device transcript on your next message (see
+   [Session loss & recovery](#session-loss--recovery)).
+4. The new token is stored in the database and overrides `QODER_PAT` on the next boot, so you never
+   have to edit `.env` to rotate.
+
+> **Security note.** The token arrives as plaintext in a Telegram message. The bot **never logs or
+> echoes it** — it shows only a non-reversible fingerprint (the same one `/health` displays) — and
+> it deletes your `/setpat` message best-effort. A bot cannot always delete a message (never in a
+> DM), so prefer running `/setpat` in a DM and treat the chat history accordingly.
 
 ---
 
 ## Groups and topics
 
-The bot works in DMs, basic groups and supergroups, with or without Topics enabled.
+The bot works in DMs, basic groups and supergroups, with or without Topics enabled. Conversations
+are keyed on **`(user, chat, topic)`** — all three — so each allowlisted member gets their own
+conversation in a shared group, and in a forum supergroup each member gets one *per topic*. The
+first message in a topic creates its conversation; nothing needs setting up in advance.
 
-Conversations are keyed on **`(tg_user_id, chat_id, message_thread_id)`** — all three. So each
-allowlisted member gets their own conversation in a shared group, and in a forum supergroup each
-member gets one *per topic*. The first message in a topic creates its conversation; nothing has
-to be set up in advance. That makes Topics the cheap way to run several named sessions at once,
-each with its own sandbox, transcript, memory store and credit ledger.
-
-Three things worth knowing:
-
-* **Promote the bot to admin in any group.** Telegram's privacy mode is on by default and then
-  delivers only `/commands`, replies to the bot's own messages and service messages — an ordinary
-  "build me a deck" never arrives. Bots added as admins always receive everything, so promoting
-  it is the whole fix. (Disabling privacy mode via @BotFather is the equivalent alternative.)
-  Privacy mode does not apply to DMs at all.
-* **Topics isolate sessions, not visibility.** Every member of a group can read every topic in
-  it. For a conversation nobody else can see, use a separate group with nobody invited, or a DM.
-* **In a non-forum group, replying to a message is not a topic.** Telegram still populates
-  `message_thread_id` on a reply — with the id of the message being replied to — so the topic is
-  read through `handlers._thread_id`, which gates on `is_topic_message`. Reading the field
-  directly keyed a brand-new conversation off every reply-to-message and silently fragmented one
-  conversation into several.
-
-A basic group that upgrades to a supergroup gets a **new chat id**, which would orphan every
-conversation keyed on the old one: they would stop matching incoming messages, yet `/sessions`
-would keep listing them (that query filters on the user, not the chat) and switching to one would
-post into a chat that no longer exists. `handlers.on_migrate` follows the upgrade — Telegram
-posts a service message into both the old chat and the new one — retiring the live conversations
-bound to the old id and rewriting the rows, so nothing is orphaned either way. The handler is not
-gated on the allowlist: the message is generated by Telegram, cannot be forged by a member, and
-its sender is not a human on the list.
+- **Promote the bot to admin in any group.** Telegram's privacy mode is on by default and then
+  delivers only `/commands`, replies to the bot, and service messages — an ordinary "build me a
+  deck" never arrives. Admins always receive everything. (Disabling privacy mode via @BotFather is
+  the equivalent alternative.) Privacy mode does not apply to DMs.
+- **Topics isolate sessions, not visibility.** Every member of a group can read every topic in it.
+  For a conversation nobody else can see, use a DM or a group with nobody invited.
+- **Replies in a non-forum group are not topics.** The bot reads the topic only from real forum
+  topics, so replying to a message does not fragment your conversation.
+- **Group → supergroup upgrades are followed automatically.** The upgrade changes the chat id; the
+  bot moves the conversations and their history across, so nothing is orphaned.
 
 ---
 
-## Layout
+## Session loss & recovery
+
+A conversation's cloud session can become unreachable — most often because the API token was
+rotated, or a sandbox was reclaimed after 24 hours of inactivity. When that happens the bot retires
+the conversation as **lost** (not deleted) and rebuilds it from the transcript it keeps on its own
+device, on a fresh session, carrying over anything still queued and re-uploading any files whose
+copies are still in `filecache/`. You will see a notice saying so; nothing you were told is lost and
+you do not have to retype anything.
+
+Automatic rebuilds are capped at a few consecutive failures per chat, so a genuinely broken session
+cannot mint a paid one every few seconds — and the transcript stays on disk either way, with
+⟳ **RESTORE** offered in `/sessions`. `/health` shows how many conversations are awaiting restore.
+
+> The full mechanics — what triggers a rebuild, what survives, and the orphan/deletion policy — are
+> in **[docs/INTERNALS.md](docs/INTERNALS.md)**.
+
+---
+
+## Project layout
 
 ```
-tgagent/            the bot; entrypoint is tgagent/__main__.py (run as `python -m tgagent`)
-deploy/             Termux setup, foreground run script, Termux:Boot script
-tgagent.db          created at runtime: conversations, transcripts, queue, credit ledger
-filecache/          created at runtime: local copies of files that crossed a conversation
+tgagent/            the bot; entrypoint tgagent/__main__.py (run as `python -m tgagent`)
+  config.py         environment loading and every tunable constant
+  auth.py           AccessControl (admin + runtime allowlist) and ownership-checked queries
+  handlers.py       Telegram update handlers and commands
+  runtime.py        backend lifecycle: build at boot, hot-swap the PAT live
+  manager.py        conversation registry, provisioning, crash reconciliation
+  convo.py          one live conversation: queue, pump, SSE consume and render loops
+  qclient.py        async HTTP client for the Qoder API (retries, SSE, signed downloads)
+  qsessions.py      Qoder resource operations: models, environments, agents, sessions, events
+  qstream.py        SSE consumer with reconnect, dedupe and a durable cursor
+  renderer.py       turns agent events into streamed, edited Telegram messages
+  db.py             SQLite persistence and migrations
+  budget.py         credit ledger and budget checks
+  history.py        on-device transcript and resume context
+  artifacts.py      artifact download and delivery
+  uploads.py        inbound attachment ingestion
+  qmemory.py        per-user memory store provisioning
+  tgsink.py         single writer to Telegram
+  tg_html.py        markdown → Telegram HTML, fence-balanced splitting
+deploy/             Termux setup, run script, Termux:Boot script
+docs/               internals & API reference
+tgagent.db          created at runtime: conversations, transcripts, queue, credits, access, token
+filecache/          created at runtime: retained file copies for cross-account resume
 ```
 
-Both runtime directories are gitignored. The database is what lets the bot reconcile after
-Android kills it, and the file cache is what lets a conversation re-upload its attachments to
-a *different* Qoder account after a PAT rotation — so neither belongs in scratch space, and
-neither belongs in version control.
+Both runtime directories are gitignored. The database is what lets the bot reconcile after Android
+kills it and what stores the runtime allowlist and token; the file cache is what lets a conversation
+re-upload its attachments to a *different* Qoder account after a rotation. Neither belongs in
+scratch space, and neither belongs in version control.
 
-The design plan lives at `~/.qoder/plans/wandering-horizon-swan.md`.
+`.env` is gitignored and is read only by `tgagent/config.py`.
 
-## Running
+---
 
-```bash
-cp .env.example .env      # fill in QODER_PAT and TG_BOT_TOKEN
-chmod 600 .env
-python -m venv --without-pip .venv && .venv/bin/python /tmp/get-pip.py   # if python3-venv is absent
-.venv/bin/pip install -e .
-.venv/bin/python -m tgagent
-```
+## Internals
 
-On Termux, use `deploy/termux_setup.sh` and run under `tmux` with `termux-wakelock`.
+**[docs/INTERNALS.md](docs/INTERNALS.md)** holds the deep reference: 15 sections of empirically
+verified Qoder API behaviour (artifact delivery, file downloads, event and streaming shapes,
+resume, credits, the live model catalog, agent updates, reasoning text, `model.effort`, context
+compaction), the per-command remote cost, and the full PAT-rotation mechanics. Where it contradicts
+the published API docs, trust it.
 
-`deploy/run.sh` and the Termux:Boot script share `logs/tgagent.pid` and refuse to start a
-second instance. Two pollers on one bot token fight over the same update queue and both lose
-messages, and they append to the same log file that one of them rotates. A stale pid file is
-cleared automatically.
+---
 
-There is no separate smoke test to run: the bot provisions its own environment on first start,
-and each user's agent and memory store on their first conversation.
+## License
 
-`.env` is gitignored and is never read by anything but `tgagent/config.py`.
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Dr. Ankur.
