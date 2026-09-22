@@ -597,6 +597,12 @@ class Manager:
             user_model_id = user["model_id"] if user else None
             model_id = row["model_id"] or user_model_id or self.settings.default_model
 
+            # Remember the store the user had BEFORE provisioning. A rotation onto a different
+            # account leaves the cached id pointing at a store that 404s, so ensure_memory_store
+            # forgets it and creates a fresh, empty one; comparing the ids afterwards is how we
+            # learn the user's long-term memory did not survive, and can tell the agent so.
+            old_store = user["memstore_id"] if user else None
+
             # Through the shared helper, so a rebuilt session carries the user's memory store
             # exactly as a freshly created one does.
             try:
@@ -606,6 +612,10 @@ class Manager:
             except BillingError as exc:
                 log.error("session resume failed due to billing error: %s", exc)
                 raise
+
+            after = auth.get_user(self.db, tg_user_id)
+            new_store = after["memstore_id"] if after else None
+            memory_reset = bool(old_store) and old_store != new_store
 
             # The old conversation is retired so the new one can hold the (chat, user, active) slot.
             auth.update_conversation(
@@ -636,7 +646,7 @@ class Manager:
                 old_convo_id, convo_id, session["id"],
                 history.event_count(self.db, old_convo_id), len(mounted),
             )
-            return convo, _compose_resume_message(transcript, mounted)
+            return convo, _compose_resume_message(transcript, mounted, memory_reset=memory_reset)
 
     async def _restore_files(
         self, convo_id: int, session_id: str, retained: list
@@ -801,7 +811,12 @@ class Manager:
         self._convos.clear()
 
 
-def _compose_resume_message(transcript: str, mounted_files: list[tuple[str, str]]) -> str:
+def _compose_resume_message(
+    transcript: str,
+    mounted_files: list[tuple[str, str]],
+    *,
+    memory_reset: bool = False,
+) -> str:
     """Message to send as the resumed conversation's first turn.
 
     Empty when there is nothing to carry over. The "History follows" scaffolding used to be
@@ -810,17 +825,39 @@ def _compose_resume_message(transcript: str, mounted_files: list[tuple[str, str]
     ordinary message, that preamble rides along with what the user actually said.
     """
     transcript = transcript.strip()
-    if not transcript and not mounted_files:
+    if not transcript and not mounted_files and not memory_reset:
         return ""
     lines = ["Resuming conversation from when your session was lost."]
     if mounted_files:
-        names = [name for name, path in mounted_files]
-        lines.append(f"Files were carried over: {', '.join(names)}.")
+        # Spell out each file's NEW mount path. The transcript below still references the paths
+        # these files had in the old sandbox, and a restored file is re-mounted at a fresh random
+        # path — so listing names alone (as this used to) left the agent Reading stale paths that
+        # no longer resolve. This is the same "mounted at exactly" contract an inbound upload's
+        # pointer_text gives it.
+        lines.append(
+            "These files were carried over into your NEW sandbox. Any path for them that appears "
+            "in the transcript below is STALE — they are now mounted at exactly these paths, so "
+            "Read them from here:"
+        )
+        for name, path in mounted_files:
+            lines.append(f"- {name} → {path}")
+    if memory_reset:
+        # The session was rebuilt under a different account, so the per-user memory store could
+        # not be carried over and a fresh, empty one was provisioned in its place. Without this
+        # the agent follows its standing instruction to read its awareness files at the start of
+        # a task and fails on a MEMORY.md that no longer exists.
+        lines.append(
+            "Note: this session was rebuilt under a different account, so your long-term memory "
+            "store is EMPTY — awareness files such as /data/.qoder/awareness/MEMORY.md from "
+            "before are not available. Do not try to read them; rely on the transcript below, and "
+            "re-create any memory notes you still need as you go."
+        )
     if transcript:
         lines.append("History follows:\n---\n")
         lines.append(transcript)
         lines.append("---")
     return "\n".join(lines)
+
 
 
 def model_choices_text(models: list[dict], current: str) -> str:

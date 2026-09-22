@@ -30,7 +30,7 @@ from .db import Database, utcnow
 from .qclient import BillingError, Conflict, NotFound, QoderError, Unauthorized
 from .qsessions import QoderAPI
 from .qstream import AckTracker, Frame, StreamConsumer
-from .renderer import ChatBudget, RenderHooks, Renderer
+from .renderer import BILLING_MARKERS, ChatBudget, RenderHooks, Renderer
 from .tgsink import TelegramSink
 
 log = logging.getLogger("tgagent.convo")
@@ -993,6 +993,31 @@ class Conversation:
     async def _on_error(self, error: dict) -> None:
         self._set_status("error")
         self.wake.set()
+        # The renderer only puts an in-stream error on the ephemeral status line, which the
+        # following session.status_idle frame overwrites with a generic "stopped (error)" inside
+        # the collapsible tool block — so the user never learns WHY the turn stopped until their
+        # next message re-hits the same failure. Post the explicit reason as a durable notice the
+        # moment it arrives. Skipped when a path that already posted the reason has run: the HTTP
+        # 402 (_stop_for_billing) and the rejected-PAT (_give_up_on_credentials) both terminate the
+        # conversation and say so themselves, and a second notice would only repeat them.
+        if self.terminated or self.credentials_rejected:
+            return
+        etype = str(error.get("type") or "error")
+        message = str(error.get("message") or "unknown error")
+        if any(marker in f"{etype} {message}".lower() for marker in BILLING_MARKERS):
+            self.notice(
+                budget.exhausted_notice(
+                    message,
+                    blocked="The turn stopped because you have no available credits.",
+                    hint="Add credits, then send your message again to continue.",
+                ),
+                is_error=True,
+            )
+        else:
+            self.notice(
+                f"The agent stopped with an error: {etype}: {message}",
+                is_error=True,
+            )
 
     async def _on_terminated(self, payload: dict) -> None:
         # Guarded: a session can emit more than one terminated-flavoured event, and without this
