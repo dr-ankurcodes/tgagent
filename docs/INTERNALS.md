@@ -322,9 +322,11 @@ tool call, a platform retry, and every turn-ending status.
 That fills a real hole rather than adding decoration. `flush_status` retracts a status message
 whose only content is filler, which is why `"working…"` never reaches the chat — so a turn that
 reasons for a minute without calling a single tool used to render as **nothing at all** until the
-answer landed. It is gated on the same `/tools` preference as the tool list, because it is the same
-kind of thing: activity feedback. (The compaction banner in section 15 deliberately is not — that
-reports conversation state, not something the agent did.)
+answer landed. It is **not** gated on the `/tools` preference: it originally was, as activity
+feedback of the same kind as the tool list, but it is now kept visible even when tools are hidden
+(`renderer.py`, `agent.thinking` branch of `_apply_delta`) — hiding tool activity is not a request
+for total silence during a long reasoning phase. (The compaction banner in section 15 is likewise
+not gated — that reports conversation state, not something the agent did.)
 
 **Fixing that exposed a worse bug behind the same gate.** The retraction used to be
 `if not self.tool_lines or not text` — *no tool lines, retract* — which meant every informative
@@ -425,8 +427,9 @@ earlier detail was summarised` banner in that turn's status message. Three delib
   by the idle transition, so a compaction landing early in a turn would have vanished before the
   answer arrived. Its own field keeps it on screen for the rest of the turn, and the next
   `session.status_running` clears it — each turn still gets its own status message.
-- **Not gated on `/tools`**, unlike the `thinking…` marker in section 13. Hiding tool activity is
-  not a request to be kept ignorant of a lossy change to conversation state.
+- **Not gated on `/tools`**, like the `thinking…` marker in section 13 (both are always visible).
+  Hiding tool activity is not a request to be kept ignorant of a lossy change to conversation
+  state.
 
 Before this the event fell through `apply`'s catch-all *and* `history.record_frame`'s, so a
 compacted session was invisible in the chat **and** in the logs — "it forgot what I said earlier"

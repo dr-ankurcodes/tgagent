@@ -24,11 +24,25 @@ TG_UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # bot sending a document
 TG_DOWNLOAD_MAX_BYTES = 20 * 1024 * 1024  # bot retrieving a user's file via getFile
 TG_SEND_INTERVAL_S = 1.05  # ~1 message/s per chat; a hair over, to stay clear of flood waits
 
+# An artifact over TG_UPLOAD_MAX_BYTES is byte-split by the deliverer and sent as numbered
+# parts of this size (headroom under the 50 MB cap for multipart framing).
+TG_UPLOAD_PART_BYTES = 48 * 1024 * 1024
+
+# Ceiling on split delivery. The parts transit phone RAM (the signed-URL download is not
+# streamed to disk), so this is a memory decision, not a Telegram one. Kept level with
+# FILE_CACHE_MAX_BYTES: a delivered artifact is also retained for resume, and one that
+# cannot fit the cache budget would evict every other cached file on arrival.
+ARTIFACT_SPLIT_MAX_BYTES = 200 * 1024 * 1024
+
 # --- Qoder hard limits --------------------------------------------------------------
 # Documented multipart limit for POST /files. Distinct from the JSON request-body cap:
 # an upload is streamed as multipart, so a 5 MB file is accepted where a 5 MB inline
 # base64 blob would not be.
 QODER_UPLOAD_MAX_BYTES = 5 * 1024 * 1024
+# Inbound files between this cap and Telegram's 20 MB download cap are chunked, uploaded
+# one request per chunk, and mounted as numbered .partNNN files the agent reassembles with
+# cat (see uploads.upload_and_mount). Chunk size leaves headroom under the multipart cap.
+QODER_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
 QODER_EVENTS_PAGE_MAX = 100
 
 # --- Rendering ---------------------------------------------------------------------
@@ -39,6 +53,12 @@ STATUS_THROTTLE_MS = 3000
 TYPING_REPEAT_S = 4  # sendChatAction expires after 5s
 TOOL_LINES_KEPT = 6  # older tool calls fold into "+N more"
 TOOL_SUMMARY_CHARS = 160
+
+# Preferred tool-input keys for a one-line summary, most specific first. Shared by the
+# renderer's live status line and the transcript rebuild in history.py, so the two summaries
+# of the same tool call cannot drift apart.
+TOOL_SUMMARY_KEYS = ("command", "file_path", "pattern", "path", "query", "url",
+                     "prompt", "description")
 
 # Quiet period after the last inbound message before a turn is dispatched. Typing three
 # quick lines then costs one billable round-trip instead of three, and the agent sees one
@@ -225,6 +245,11 @@ AGENT_SYSTEM = (
     "- When you create a file the user should receive (a .pptx, .pdf, image, dataset, script), "
     "write it under /data/ and then call DeliverArtifacts on it. Files you do not deliver are "
     "invisible to the user.\n"
+    "- Telegram can only receive files up to 50 MB. If a deliverable will be larger, compress "
+    "it (.zip) or split it logically (e.g. several documents) and deliver those — the bot can "
+    "otherwise only send raw numbered byte-parts the user must rejoin by hand, and a .zip or a "
+    "logical split is far friendlier. Large files the user SENDS you may likewise arrive "
+    "mounted as .partNNN pieces; the message tells you how to reassemble them.\n"
     "- When the user attaches a file, it is mounted under /data/workspace/uploads/ and the "
     "message tells you the exact path. Use Read on it; Read decodes images natively, so you "
     "can genuinely see pictures.\n"

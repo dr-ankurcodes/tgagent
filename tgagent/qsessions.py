@@ -379,16 +379,31 @@ class QoderAPI:
         Compared with :func:`model_matches` rather than by id: an /effort change alters the
         model object without altering its id, so an id-only check reported the agent as already
         correct and the new effort was never sent.
+
+        Also pushes ``AGENT_SYSTEM`` when the remote prompt has drifted from the constant, so
+        a prompt change reaches EXISTING users' agents on their next conversation instead of
+        only agents created from then on. Drift is only acted on when the API actually returned
+        a system prompt: an absent field is not proof of a stale one, and treating it as such
+        would PUT (and bump the version of) every agent on every provisioning.
         """
         wanted = await self._model_ref(model_id, tg_user_id)
         current = agent.get("model")
-        if model_matches(current, wanted):
+        remote_system = agent.get("system")
+        system_stale = (
+            isinstance(remote_system, str)
+            and bool(remote_system)
+            and remote_system != config.AGENT_SYSTEM
+        )
+        if model_matches(current, wanted) and not system_stale:
             return
         current_id = current.get("id") if isinstance(current, dict) else current
         log.info(
-            "agent for user %s is on %r; switching to %r", tg_user_id, current_id, wanted
+            "agent for user %s is on %r (system prompt %s); updating to %r",
+            tg_user_id, current_id, "stale" if system_stale else "current", wanted,
         )
-        await self.set_agent_model(agent["id"], wanted)
+        await self.set_agent_model(
+            agent["id"], wanted, system=config.AGENT_SYSTEM if system_stale else None
+        )
 
     async def _adopt_agent_by_name(self, name: str, tg_user_id: int) -> dict | None:
         """Pick up an agent that already exists remotely but is not in our database.
@@ -508,8 +523,10 @@ class QoderAPI:
             self._forget_agent(row["agent_id"])
         return [row["agent_id"] for row in stale]
 
-    async def set_agent_model(self, agent_id: str, model: str | dict) -> dict:
-        """Change an agent's model. Returns the updated agent.
+    async def set_agent_model(
+        self, agent_id: str, model: str | dict, *, system: str | None = None
+    ) -> dict:
+        """Change an agent's model (and optionally its system prompt). Returns the updated agent.
 
         Two things the live API insists on, both discovered the hard way:
 
@@ -518,7 +535,8 @@ class QoderAPI:
           PATCH, which is part of why it was never called and /model never worked.
         * PUT replaces the whole object. Sending only ``{"model": ...}`` would drop the system
           prompt and every tool permission, so the current definition is read back and
-          re-sent with just the model changed.
+          re-sent with just the model changed. ``system`` overrides that read-back for the
+          one caller that needs to push a changed AGENT_SYSTEM (see :meth:`_sync_model`).
 
         Agents use optimistic concurrency: a stale ``version`` is a 409, so the version is read
         fresh immediately before each attempt and a conflict retries once.
@@ -528,7 +546,8 @@ class QoderAPI:
             payload = {
                 "name": current["name"],
                 "description": current.get("description") or "",
-                "system": current.get("system") or config.AGENT_SYSTEM,
+                "system": system if system is not None
+                          else (current.get("system") or config.AGENT_SYSTEM),
                 "model": model,
                 "tools": current.get("tools") or build_tools(),
                 "version": int(current.get("version") or 1),

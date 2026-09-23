@@ -260,12 +260,15 @@ class Database:
             self.conn.row_factory = sqlite3.Row
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA foreign_keys=ON")
-            # FULL, not NORMAL. NORMAL+WAL survives a process crash — which is the common case
-            # on Android — but loses the last committed transactions on an OS crash or battery
-            # pull, and the module docstring promises durable state is committed eagerly because
-            # process death is inevitable. A phone losing power mid-checkpoint is realistic
-            # enough that the fsync cost is the price of keeping that promise.
-            self.conn.execute("PRAGMA synchronous=FULL")
+            # WAL + NORMAL, not FULL. NORMAL survives a process crash — Android killing the
+            # bot, by far the common case — identically to FULL; the only extra exposure is
+            # losing the last committed transactions on a full OS crash or battery pull. FULL
+            # cost 3+ fsyncs per rendered event (frame record, ack insert, cursor update), all
+            # synchronous on the event loop, which on slow phone flash stalled every
+            # conversation's SSE reads and Telegram writes. Every consumer of this database
+            # already treats a missing tail as recoverable (reconcile, resume, queue re-claim),
+            # so loop latency is worth more than that last fsync.
+            self.conn.execute("PRAGMA synchronous=NORMAL")
             self.conn.execute("PRAGMA busy_timeout=5000")
             self._restrict()
             self._migrate()

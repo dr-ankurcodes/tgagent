@@ -291,8 +291,7 @@ def _summarise_blob(blob: str | None) -> str:
         except json.JSONDecodeError:
             parsed = None
         if isinstance(parsed, dict):
-            for key in ("command", "file_path", "pattern", "path", "query", "url",
-                        "prompt", "description"):
+            for key in config.TOOL_SUMMARY_KEYS:
                 value = parsed.get(key)
                 if isinstance(value, str) and value.strip():
                     return tg_html.truncate(value.strip().splitlines()[0], 160)
@@ -561,3 +560,20 @@ def take_queued_texts(db: Database, convo_id: int) -> list[str]:
             (config.RESUME_QUEUE_STATE, utcnow(), row["id"]),
         )
     return texts
+
+
+def requeue_texts(db: Database, convo_id: int, texts: list[str]) -> None:
+    """Put claimed texts back into a conversation's durable queue as fresh ``queued`` rows.
+
+    The counterpart of :func:`take_queued_texts` for every path where a rebuild does NOT
+    complete: the claimed texts existed only in a local variable, and without this a failed
+    auto-resume (billing, transient API error, teardown, crash) silently dropped messages the
+    user had already sent. Fresh inserts keep the original relative order, and the next resume
+    claims them again through :func:`take_queued_texts`.
+    """
+    for text in texts:
+        db.execute(
+            """INSERT INTO inbound_queue(convo_id, kind, payload_json, state, created_at)
+               VALUES(?, 'text', ?, 'queued', ?)""",
+            (convo_id, json.dumps({"text": text}), utcnow()),
+        )

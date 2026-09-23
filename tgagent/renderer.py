@@ -1114,7 +1114,7 @@ def summarise_tool_input(name: str, raw: dict) -> str:
     if not isinstance(raw, dict):
         return clip(str(raw))
 
-    for key in ("command", "file_path", "pattern", "path", "query", "url", "prompt", "description"):
+    for key in config.TOOL_SUMMARY_KEYS:
         value = raw.get(key)
         if isinstance(value, str) and value.strip():
             return clip(value.strip().splitlines()[0])

@@ -1,6 +1,8 @@
 [project]
 name = "tgagent"
 description = "Telegram remote control for Qoder Cloud Agents"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
 # Single-sourced from tgagent.__version__, which qclient also reads for its User-Agent, so a
 # bump cannot leave the package metadata and the running bot disagreeing.
@@ -14,7 +16,8 @@ dependencies = [
 tgagent = "tgagent.__main__:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+# >=77 for the SPDX `license = "MIT"` string (PEP 639).
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

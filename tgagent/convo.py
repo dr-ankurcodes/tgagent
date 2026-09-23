@@ -22,6 +22,7 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 
 from . import auth, budget, config, history, tg_html
@@ -61,14 +62,14 @@ class Conversation:
         *,
         db: Database,
         api: QoderAPI,
-        settings,
+        settings: config.Settings,
         row: sqlite3.Row,
         sink: TelegramSink,
         chat_budget: ChatBudget,
         stream_slots: asyncio.Semaphore,
-        on_fatal=None,
-        on_gone=None,
-        on_ended=None,
+        on_fatal: Callable[[Conversation], Awaitable[None]] | None = None,
+        on_gone: Callable[[Conversation], Awaitable[None]] | None = None,
+        on_ended: Callable[[Conversation], Awaitable[None]] | None = None,
     ):
         self.db = db
         self.api = api
@@ -171,13 +172,11 @@ class Conversation:
     async def shutdown(self) -> None:
         self.stop.set()
         self.wake.set()
-        # First, retire this conversation so no new detached task can be scheduled.
-        if not self.stop.is_set():
-            log.warning("shutdown without stop being set")
         # Cancel existing tasks and await them. Detached tasks are separate from the main three;
         # they're created by _schedule_detached to avoid a task awaiting its own shutdown from
         # inside the event loop. We must still await them here or the HTTP client closes while
-        # one is in-flight.
+        # one is in-flight — except the current task: retire() → shutdown() called from inside
+        # a detached _on_gone task would otherwise gather itself and raise RuntimeError.
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -186,7 +185,10 @@ class Conversation:
         # Await all detached tasks so _auto_resume cannot mint a replacement session after the
         # process tears down and the HTTP client has already been closed.
         if self._detached:
-            await asyncio.gather(*self._detached, return_exceptions=True)
+            current = asyncio.current_task()
+            await asyncio.gather(
+                *(t for t in self._detached if t is not current), return_exceptions=True
+            )
 
     # --- durable cursor -----------------------------------------------------------
 

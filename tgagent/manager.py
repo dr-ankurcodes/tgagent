@@ -52,7 +52,10 @@ class Manager:
         # (cancelling tasks, waiting for hooks, force-flushing); without this a concurrent
         # active_for/switch_to saw the empty slot mid-retirement and adopted a SECOND live
         # conversation for the same row — two renderers writing one chat at once.
-        self._lifecycle_locks: dict[int, asyncio.Lock] = {}
+        # Reference-counted (lock, holders): the entry is dropped only when its last holder
+        # releases, so the registry stays bounded without ever discarding a lock object another
+        # coroutine still references.
+        self._lifecycle_locks: dict[int, tuple[asyncio.Lock, int]] = {}
         # Set during shutdown so a detached retirement task cannot mint a replacement session
         # (auto_resume) while the process is tearing down and the HTTP client is about to close.
         self._shutting_down = False
@@ -79,12 +82,28 @@ class Manager:
         return lock
 
     def _lifecycle_lock(self, convo_id: int) -> asyncio.Lock:
-        """The retire/adopt lock for one conversation, so the two cannot interleave."""
-        lock = self._lifecycle_locks.get(convo_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._lifecycle_locks[convo_id] = lock
+        """Acquire a reference to the retire/adopt lock for one conversation.
+
+        Every call must be paired with :meth:`_lifecycle_unlock` in a ``finally``. The count is
+        bumped synchronously before any await, so no two coroutines can race the entry itself.
+        Popping the lock unconditionally on release — the old behaviour — let a third caller
+        mint a NEW lock while a waiter was still queued on the released one, silently breaking
+        the mutual exclusion this lock exists to provide.
+        """
+        lock, count = self._lifecycle_locks.get(convo_id) or (asyncio.Lock(), 0)
+        self._lifecycle_locks[convo_id] = (lock, count + 1)
         return lock
+
+    def _lifecycle_unlock(self, convo_id: int) -> None:
+        """Release one reference taken by :meth:`_lifecycle_lock`; drop the entry at zero."""
+        entry = self._lifecycle_locks.get(convo_id)
+        if entry is None:
+            return
+        lock, count = entry
+        if count <= 1:
+            self._lifecycle_locks.pop(convo_id, None)
+        else:
+            self._lifecycle_locks[convo_id] = (lock, count - 1)
 
     async def _notify_chat(self, convo: Conversation, text: str, *, is_error: bool = True) -> None:
         """Send to a chat whose conversation has already been retired.
@@ -210,19 +229,22 @@ class Manager:
         """Build and start a conversation, protecting against retire-then-replace."""
         convo_id = row["convo_id"]
         lock = self._lifecycle_lock(convo_id)
-        async with lock:
-            if convo_id in self._convos:
-                return self._convos[convo_id]
-            convo = self._build(row)
-            self._convos[convo_id] = convo
-            try:
-                await convo.start()
-                convo.warn_if_workspace_reclaimed()
-            except Exception:  # noqa: BLE001 - the lock already held prevents a race
-                log.exception("could not start conversation %s", convo_id)
-                self._convos.pop(convo_id, None)
-                raise
-            return convo
+        try:
+            async with lock:
+                if convo_id in self._convos:
+                    return self._convos[convo_id]
+                convo = self._build(row)
+                self._convos[convo_id] = convo
+                try:
+                    await convo.start()
+                    convo.warn_if_workspace_reclaimed()
+                except Exception:  # noqa: BLE001 - the lock already held prevents a race
+                    log.exception("could not start conversation %s", convo_id)
+                    self._convos.pop(convo_id, None)
+                    raise
+                return convo
+        finally:
+            self._lifecycle_unlock(convo_id)
 
     def _build(self, row: sqlite3.Row) -> Conversation:
         sink = TelegramSink(self.bot, message_thread_id=row["message_thread_id"])
@@ -269,10 +291,12 @@ class Manager:
         queued = history.take_queued_texts(self.db, convo.convo_id)
         await self.retire(convo.convo_id)
         if self._shutting_down:
-            # Do not mint a replacement session during teardown. The queued texts are durable and
-            # the conversation is already marked lost, so the next boot reconciles it and /sessions
-            # still offers ⟳ RESTORE. Rebuilding now would race the HTTP client that post_shutdown
-            # closes the moment Manager.shutdown returns.
+            # Do not mint a replacement session during teardown. The claimed texts are put back
+            # durably — in memory they would vanish with the process — the conversation is
+            # already marked lost, so the next boot reconciles it and /sessions still offers
+            # ⟳ RESTORE, which re-claims the queue. Rebuilding now would race the HTTP client
+            # that post_shutdown closes the moment Manager.shutdown returns.
+            history.requeue_texts(self.db, convo.convo_id, queued)
             return
         await self._auto_resume(convo, queued)
 
@@ -313,6 +337,7 @@ class Manager:
                 "transcript is safe on disk and /sessions still offers ⟳ RESTORE.",
                 convo.convo_id, attempts,
             )
+            history.requeue_texts(self.db, convo.convo_id, queued)
             await self._notify_chat(convo, "That conversation could not be rebuilt automatically. Use /sessions and tap ⟳ RESTORE to try again, or /new to start fresh.")
             return
 
@@ -322,6 +347,13 @@ class Manager:
         # a message arriving mid-rebuild can cause this error, and counting it would poison
         # the counter on the next normal message. Only a real blockage that prevents resume
         # (None or BillingError) should contribute to the limit.
+        #
+        # EVERY failure exit below puts the claimed texts back into the old conversation's
+        # durable queue first. They exist only in a local variable once take_queued_texts has
+        # marked the rows "moved" — a state nothing re-reads — so without the requeue a failed
+        # rebuild silently lost messages the user had already sent, contradicting this module's
+        # prefer-duplicate-over-loss doctrine. The next resume (manual ⟳ RESTORE or automatic)
+        # re-claims them inside resume_lost_conversation.
         try:
             resumed = await self.resume_lost_conversation(
                 tg_user_id=convo.tg_user_id,
@@ -330,8 +362,9 @@ class Manager:
             )
         except BillingError as exc:
             # This is a real blockage: no credits to rebuild with. Count it and bail.
+            history.requeue_texts(self.db, convo.convo_id, queued)
             self._resume_attempts[key] = attempts + 1
-            if self._resume_attempts[key] > config.AUTO_RESUME_MAX_ATTEMPTS:
+            if self._resume_attempts[key] >= config.AUTO_RESUME_MAX_ATTEMPTS:
                 await self._notify_chat(convo, "Could not rebuild that conversation: no available credit to restore it. Please renew your plan or add credits, then use /sessions and tap ⟳ RESTORE, or /new to start fresh.")
             else:
                 await self._notify_chat(convo, f"Could not rebuild that conversation: {exc.message}. Please renew your plan or add credits, then use /sessions and tap ⟳ RESTORE to try again.")
@@ -340,13 +373,31 @@ class Manager:
             # Not fatal: the user's next message reaches the same path through the handler,
             # where the failure can be reported to them directly. But tell them now so there's
             # no dead silence between one error and the next attempt.
+            history.requeue_texts(self.db, convo.convo_id, queued)
             log.warning("could not rebuild conversation %s: %s", convo.convo_id, exc.message)
             await self._notify_chat(convo, f"Could not rebuild that conversation: {exc.message}. Send your message again and I will retry; or use /sessions and tap ⟳ RESTORE to try again.")
             return
+        except Exception:  # noqa: BLE001 - never lose claimed texts to an unexpected failure
+            history.requeue_texts(self.db, convo.convo_id, queued)
+            log.exception("unexpected failure rebuilding conversation %s", convo.convo_id)
+            await self._notify_chat(convo, "Could not rebuild that conversation due to an unexpected error. Your pending messages were kept; use /sessions and tap ⟳ RESTORE to try again.")
+            return
 
         if resumed is None:
-            # Nothing resuming existed — likely the user already tapped ⟳ RESTOIRE somewhere else.
-            # Do not count this against the limit; the user explicitly intervened.
+            # Nothing resuming existed — likely the user already tapped ⟳ RESTORE somewhere else.
+            # Do not count this against the limit; the user explicitly intervened. The claimed
+            # texts belong to whatever conversation is now active in this chat; if there is none,
+            # put them back on the old row so they stay on disk rather than vanish.
+            active = await self.active_for(convo.tg_user_id, convo.chat_id, convo.thread_id)
+            if active is not None:
+                for text in queued:
+                    active.send_text(text)
+            else:
+                history.requeue_texts(self.db, convo.convo_id, queued)
+                log.warning(
+                    "no active conversation for claimed texts of %s; requeued on the old row",
+                    convo.convo_id,
+                )
             return
 
         # This rebuild worked, so the next loss starts counting from zero again.
@@ -524,7 +575,14 @@ class Manager:
         row = auth.get_conversation(self.db, convo_id, tg_user_id)
         convo = self._build(row)
         self._convos[convo_id] = convo
-        await convo.start()
+        try:
+            await convo.start()
+        except Exception:  # noqa: BLE001 - never leave a corpse in the registry
+            # Same guard _adopt has: without it a failed start left the conversation registered
+            # with no running tasks, and every later active_for kept returning the dead object.
+            log.exception("could not start conversation %s", convo_id)
+            self._convos.pop(convo_id, None)
+            raise
         log.info("created conversation %s (session %s, agent %s, model %s) for user %s",
                  convo_id, session["id"], agent_id, model_id, tg_user_id)
         return convo
@@ -639,7 +697,26 @@ class Manager:
             new_row = auth.get_conversation(self.db, convo_id, tg_user_id)
             convo = self._build(new_row)
             self._convos[convo_id] = convo
-            await convo.start()
+            try:
+                await convo.start()
+            except Exception:  # noqa: BLE001 - never leave a corpse in the registry
+                log.exception("could not start resumed conversation %s", convo_id)
+                self._convos.pop(convo_id, None)
+                raise
+
+            # Claim anything still durably queued for the OLD conversation — messages a previous
+            # failed rebuild put back with history.requeue_texts, or that arrived between the
+            # loss being detected and the old pump stopping. Done only after the new conversation
+            # is live: claiming earlier and then failing provisioning would strand the texts in
+            # the "moved" state nothing ever re-reads.
+            carried = history.take_queued_texts(self.db, old_convo_id)
+            for text in carried:
+                convo.send_text(text)
+            if carried:
+                convo.notice(
+                    f"Re-queued {len(carried)} message(s) that were still waiting when the "
+                    "session was lost; they will be processed now."
+                )
 
             log.info(
                 "resumed conversation %s as %s (session %s) with %d history event(s) and %d file(s)",
@@ -654,7 +731,10 @@ class Manager:
         """Re-upload cached files into the new session. Returns (filename, mount_path) pairs.
 
         A file that fails to upload is skipped rather than aborting the resume: losing one
-        attachment is much better than losing the whole conversation.
+        attachment is much better than losing the whole conversation. A file too big for one
+        Qoder upload is re-chunked by ``upload_and_mount``, and its entry in the returned list
+        carries the reassembly command so the resume message hands the agent the rebuilt file
+        the same way an inbound pointer text does.
         """
         mounted: list[tuple[str, str]] = []
         for row in retained:
@@ -666,24 +746,27 @@ class Manager:
                 continue
             filename = row["filename"] or path.name
             try:
-                uploaded = await self.api.upload(
-                    contents, filename,
+                restored = await uploads.upload_and_mount(
+                    self.api, session_id, contents, filename,
                     metadata={"convo_id": convo_id, "source": "resume",
                               "original_file_id": row["file_id"]},
                 )
-                new_file_id = uploaded.get("id")
-                if not new_file_id:
-                    log.warning("re-upload of %s returned no file id", filename)
-                    continue
-                mount_path = uploads.unique_mount_path(filename)
-                await self.api.attach_file(session_id, new_file_id, mount_path)
             except QoderError as exc:
                 log.warning("could not restore %s into session %s: %s",
                             filename, session_id, exc.message)
                 continue
-            mounted.append((filename, mount_path))
+            if restored.chunked:
+                where = (
+                    f"{restored.mount_path} — too big for a single upload, so it is mounted as "
+                    f"{len(restored.parts)} parts at {restored.mount_path}.partNNN. Reassemble "
+                    f"it first with: cat {restored.mount_path}.part* > {restored.mount_path} "
+                    f"(the result must be exactly {restored.size_bytes} bytes)"
+                )
+            else:
+                where = restored.mount_path
+            mounted.append((filename, where))
             history.retain_file(
-                self.db, convo_id=convo_id, file_id=new_file_id, contents=contents,
+                self.db, convo_id=convo_id, file_id=restored.file_id, contents=contents,
                 filename=filename, owner_type=row["owner_type"],
             )
         return mounted
@@ -727,11 +810,16 @@ class Manager:
         # and adopted a SECOND live Conversation for the same row — two renderers writing one chat
         # at once, breaking the single-writer invariant every other path obeys.
         lock = self._lifecycle_lock(convo_id)
-        async with lock:
-            convo = self._convos.pop(convo_id, None)
-            if convo:
-                await convo.shutdown()
-                log.info("retired conversation %s", convo_id)
+        try:
+            async with lock:
+                convo = self._convos.pop(convo_id, None)
+                if convo:
+                    await convo.shutdown()
+                    log.info("retired conversation %s", convo_id)
+        finally:
+            # Reference-counted release: the entry survives while any other coroutine still
+            # holds or waits on this lock, so no caller can end up on a different lock object.
+            self._lifecycle_unlock(convo_id)
 
         # Prune the per-chat provision locks to keep the registry bounded. Only unlocked entries
         # are dropped — discarding a held lock would let a second caller into the critical section
@@ -742,10 +830,6 @@ class Manager:
         if len(stale) + len(self._provision_locks) > 256:
             for key in stale[:len(stale)//2]:
                 self._provision_locks.pop(key, None)
-
-        # Prune the lifecycle locks we just released; they can grow unbounded if conversations
-        # are archived/forgotten in quick succession and the garbage collector doesn't notice.
-        self._lifecycle_locks.pop(convo_id, None)
 
     async def forget_chat(self, chat_id: int) -> int:
         """Retire every live conversation bound to a chat id. Returns how many were retired.
@@ -803,6 +887,10 @@ class Manager:
     # --- shutdown -----------------------------------------------------------------
 
     async def shutdown(self) -> None:
+        # Set FIRST: a detached _on_gone task racing teardown checks this before it can mint a
+        # replacement session via _auto_resume against the HTTP client post_shutdown is about
+        # to close. Without it the flag was dead — initialized, checked, never assigned.
+        self._shutting_down = True
         log.info("shutting down %d conversations", len(self._convos))
         await asyncio.gather(
             *(convo.shutdown() for convo in list(self._convos.values())),

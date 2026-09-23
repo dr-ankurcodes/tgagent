@@ -10,7 +10,10 @@ image block, which inflates the payload by 33% against the 4 MB request-body cap
 image tokens on every subsequent turn.
 
 Two hard caps to respect: Telegram lets a bot download at most 20 MB via getFile, and the
-Qoder multipart upload accepts about 5 MB of file content.
+Qoder multipart upload accepts about 5 MB of file content per request. The gap between them
+is bridged by chunking: a larger file is uploaded in <5 MB pieces, mounted side by side as
+numbered ``.partNNN`` files, and the pointer message tells the agent to reassemble it with a
+single ``cat`` — see :func:`upload_and_mount`.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from __future__ import annotations
 import logging
 import re
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
 from telegram import Message
@@ -49,6 +52,83 @@ class Ingested:
     mime_type: str | None
     size_bytes: int
     pointer_text: str
+
+
+@dataclass
+class Mounted:
+    """One logical file uploaded to Qoder and mounted into a session.
+
+    ``parts`` has a single entry for an ordinary upload; for a chunked one it lists every
+    piece in order, and ``mount_path`` is the reassembly target rather than a file that
+    already exists in the sandbox.
+    """
+
+    file_id: str
+    mount_path: str
+    parts: list[tuple[str, str]] = field(default_factory=list)
+    size_bytes: int = 0
+
+    @property
+    def chunked(self) -> bool:
+        return len(self.parts) > 1
+
+
+async def upload_and_mount(
+    api: QoderAPI,
+    session_id: str,
+    contents: bytes,
+    filename: str,
+    *,
+    metadata: dict | None = None,
+) -> Mounted:
+    """Upload a file to Qoder and mount it into the session, chunking it if it is too big.
+
+    Qoder's multipart endpoint takes about 5 MB per request, but Telegram users can send up
+    to 20 MB, so a larger file is uploaded in ``QODER_UPLOAD_CHUNK_BYTES`` pieces and the
+    pieces are mounted side by side as ``<base>.part000``, ``<base>.part001``, ... The agent
+    reassembles them with one ``cat``; the exact command rides along in the pointer text
+    (inbound) or the resume message (restore), never in the agent's head.
+
+    Raises ``QoderError`` on the first piece that fails. Pieces uploaded before that stay in
+    the account as orphans — the same failure mode a single-piece upload already had, and
+    the account's file list is not something a conversation depends on.
+    """
+    if len(contents) <= config.QODER_UPLOAD_MAX_BYTES:
+        file_id = _uploaded_id(await api.upload(contents, filename, metadata=metadata), filename)
+        mount_path = unique_mount_path(filename)
+        await api.attach_file(session_id, file_id, mount_path)
+        return Mounted(
+            file_id=file_id,
+            mount_path=mount_path,
+            parts=[(file_id, mount_path)],
+            size_bytes=len(contents),
+        )
+
+    base = unique_mount_path(filename)
+    chunk_size = config.QODER_UPLOAD_CHUNK_BYTES
+    total = -(-len(contents) // chunk_size)  # ceildiv, so partNNN naming needs no lookahead
+    parts: list[tuple[str, str]] = []
+    for index in range(total):
+        chunk = contents[index * chunk_size:(index + 1) * chunk_size]
+        part_meta = dict(metadata or {})
+        part_meta.update({"part": index, "parts": total, "whole_filename": filename})
+        part_name = f"{filename}.part{index:03d}"
+        file_id = _uploaded_id(await api.upload(chunk, part_name, metadata=part_meta), part_name)
+        part_path = f"{base}.part{index:03d}"
+        await api.attach_file(session_id, file_id, part_path)
+        parts.append((file_id, part_path))
+    return Mounted(file_id=parts[0][0], mount_path=base, parts=parts, size_bytes=len(contents))
+
+
+def _uploaded_id(uploaded: dict, name: str) -> str:
+    file_id = uploaded.get("id")
+    if not file_id:
+        # Shaped as a QoderError so both callers (ingest, and the manager's resume restore,
+        # which must never let one file abort the rebuild) handle it on a path they already have.
+        raise QoderError(
+            502, f"upload of {name} returned no file id", error_type="unexpected_shape"
+        )
+    return file_id
 
 
 def slugify(name: str, fallback: str = "file") -> str:
@@ -124,11 +204,6 @@ async def ingest(
             f"that file is {size // (1024 * 1024)} MB. Telegram only lets a bot download "
             "up to 20 MB."
         )
-    if size > config.QODER_UPLOAD_MAX_BYTES:
-        raise IngestError(
-            f"that file is {size / (1024 * 1024):.1f} MB. The Qoder upload endpoint accepts "
-            "about 5 MB. Try splitting it, or send the important part as text."
-        )
 
     try:
         remote = await tg_file.get_file()
@@ -137,98 +212,106 @@ async def ingest(
         log.warning("telegram download failed for %s: %s", filename, exc)
         raise IngestError(f"Telegram would not give me that file ({type(exc).__name__}).") from exc
 
-    # The two checks above trust Telegram's reported file_size, which can be missing (None -> 0)
+    # The check above trusts Telegram's reported file_size, which can be missing (None -> 0)
     # or simply wrong, and download_as_bytearray itself is uncapped. The real bytes are the only
-    # trustworthy bound, so re-check them: a missing size sailed past both pre-checks entirely,
-    # and an oversized file would otherwise reach the Qoder upload and fail there with a less
-    # useful error after the whole download had already been paid for in memory.
+    # trustworthy bound, so re-check them: a missing size sailed past the pre-check entirely.
+    # The Qoder-side 5 MB cap is no longer a rejection reason — upload_and_mount chunks
+    # anything between it and Telegram's 20 MB download cap.
     actual = len(contents)
     if actual > config.TG_DOWNLOAD_MAX_BYTES:
         raise IngestError(
             f"that file turned out to be {actual // (1024 * 1024)} MB. Telegram only lets a bot "
             "download up to 20 MB."
         )
-    if actual > config.QODER_UPLOAD_MAX_BYTES:
-        raise IngestError(
-            f"that file is {actual / (1024 * 1024):.1f} MB. The Qoder upload endpoint accepts "
-            "about 5 MB. Try splitting it, or send the important part as text."
-        )
 
     metadata = {"convo_id": convo_id, "tg_user_id": tg_user_id, "source": "telegram"}
     try:
-        uploaded = await api.upload(bytes(contents), filename, metadata=metadata)
+        mounted = await upload_and_mount(
+            api, session_id, bytes(contents), filename, metadata=metadata
+        )
     except QoderError as exc:
-        log.warning("qoder upload rejected %s (%s): %s", filename, exc.status, exc.message)
+        log.warning("qoder upload/mount failed for %s (%s): %s", filename, exc.status, exc.message)
         raise IngestError(
-            f"Qoder rejected that file ({exc.status}: {exc.message}). "
-            "Only files up to about 5 MB are accepted."
+            f"Qoder would not take that file ({exc.status}: {exc.message})."
         ) from exc
-
-    file_id = uploaded.get("id")
-    if not file_id:
-        raise IngestError("Qoder accepted the upload but returned no file id.")
-
-    mount_path = unique_mount_path(filename)
-    try:
-        await api.attach_file(session_id, file_id, mount_path)
-    except QoderError as exc:
-        log.warning("mount failed for %s: %s", file_id, exc.message)
-        raise IngestError(f"the file uploaded but could not be mounted ({exc.message}).") from exc
 
     auth.record_tg_file(
         db,
-        file_id=file_id,
+        file_id=mounted.file_id,
         owner_tg_user_id=tg_user_id,
         convo_id=convo_id,
         filename=filename,
         mime_type=mime_type,
-        size_bytes=size,
-        mount_path=mount_path,
+        size_bytes=actual,
+        mount_path=mounted.mount_path,
     )
 
     # Keep a local copy. The uploaded file belongs to whichever account the PAT pointed at, so
     # after a rotation it is unreachable; this copy is what lets a resumed conversation
-    # re-mount the same file under the new account. Best-effort: a full disk must not lose the
-    # user's message, which has already been accepted by the API at this point.
+    # re-mount the same file under the new account (re-chunking it on the way, if needed).
+    # Best-effort: a full disk must not lose the user's message, which has already been
+    # accepted by the API at this point.
     history.retain_file(
         db,
         convo_id=convo_id,
-        file_id=file_id,
+        file_id=mounted.file_id,
         contents=bytes(contents),
         filename=filename,
         owner_type="user",
     )
 
     return Ingested(
-        file_id=file_id,
-        mount_path=mount_path,
+        file_id=mounted.file_id,
+        mount_path=mounted.mount_path,
         filename=filename,
         mime_type=mime_type,
-        size_bytes=size,
-        pointer_text=build_pointer_text(filename, mime_type, size, mount_path, caption),
+        size_bytes=actual,
+        pointer_text=build_pointer_text(filename, mime_type, mounted, caption),
     )
 
 
 def build_pointer_text(
     filename: str,
     mime_type: str | None,
-    size: int,
-    mount_path: str,
+    mounted: Mounted,
     caption: str | None = None,
 ) -> str:
     """What the agent actually receives.
 
     The agent cannot see the Telegram message, so the path has to be spelled out. Mentioning
     that Read decodes images is what makes "what is in this photo?" work without a nudge.
+    For a chunked upload the reassembly command is spelled out the same way: an agent left
+    to guess from ``.partNNN`` filenames alone sometimes Reads a part and reasons from a
+    truncated file.
     """
+    size = mounted.size_bytes
     size_label = f"{size / 1024:.0f} KB" if size < 1024 * 1024 else f"{size / (1024 * 1024):.1f} MB"
     lines = [
         f"The user attached a file: {filename}"
         + (f" ({mime_type}, {size_label})" if mime_type else f" ({size_label})"),
-        f"It is mounted in your sandbox at exactly: {mount_path}",
-        "Use the Read tool on that path to inspect it. Read decodes images natively, so you "
-        "can see pictures directly; for other formats use Bash as needed.",
     ]
+    if mounted.chunked:
+        lines.append(
+            f"It is larger than the {config.QODER_UPLOAD_MAX_BYTES // (1024 * 1024)} MB "
+            f"per-file upload limit, so it was split into {len(mounted.parts)} parts, mounted "
+            "in your sandbox at exactly:"
+        )
+        lines.extend(f"- {path}" for _, path in mounted.parts)
+        lines.append("Reassemble it with a single command BEFORE using it:")
+        lines.append(f"cat {mounted.mount_path}.part* > {mounted.mount_path}")
+        lines.append(
+            f"The result must be exactly {size} bytes; verify with `wc -c < {mounted.mount_path}` "
+            "and treat any mismatch as a corrupt file."
+        )
+        lines.append(
+            f"Then work with {mounted.mount_path} as the original file; ignore the parts."
+        )
+    else:
+        lines.append(f"It is mounted in your sandbox at exactly: {mounted.mount_path}")
+        lines.append(
+            "Use the Read tool on that path to inspect it. Read decodes images natively, so you "
+            "can see pictures directly; for other formats use Bash as needed."
+        )
     if caption and caption.strip():
         lines.append("")
         lines.append("The user's message was:")

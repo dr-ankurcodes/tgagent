@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sqlite3
 import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
@@ -1457,7 +1458,7 @@ def _should_show_id(db, tg_user_id: int) -> bool:
             (int(time.time()), tg_user_id, config.ID_REMINDER_S),
         )
         return bool(cur.rowcount)
-    except sqlite3.DatabaseError:  # noqa: BLE001 - if SQLite misbehaves, don't let it kill the handler
+    except sqlite3.DatabaseError:  # if SQLite misbehaves, don't let it kill the handler
         log.exception("could not update last_id_request")
         return False
 

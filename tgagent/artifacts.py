@@ -8,6 +8,12 @@ The path is three steps, verified in Phase 0 and unlike what the docs describe:
 
 Because the link expires, we fetch it immediately rather than storing it. And because the
 signed URL is third-party, the client fetches it without our bearer token.
+
+Telegram refuses documents over 50 MB from a bot, so a larger artifact (up to
+``ARTIFACT_SPLIT_MAX_BYTES``) is byte-split by the deliverer and sent as numbered parts with
+a rejoin notice. The system prompt nudges the agent to compress or logically split big
+deliverables first — a .zip is friendlier than raw parts — but the split here is the hard
+guarantee that no deliverable in range is simply lost.
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ SEND_ATTEMPTS = 2
 
 # Ceiling on cross-boot retries. A transient Telegram failure leaves the row pending so the next
 # boot tries again, but a file Telegram repeatedly refuses is not transient — and without a cap it
-# was re-downloaded (up to 50 MB into phone RAM) on every single start, forever.
+# was re-downloaded (up to ARTIFACT_SPLIT_MAX_BYTES into phone RAM) on every single start, forever.
 MAX_BOOT_RETRIES = 5
 
 
@@ -133,13 +139,14 @@ class ArtifactDeliverer:
             )
             size = 0
 
-        if size > config.TG_UPLOAD_MAX_BYTES:
-            reason = f"too large for telegram ({size} bytes)"
+        if size > config.ARTIFACT_SPLIT_MAX_BYTES:
+            reason = f"too large even for split delivery ({size} bytes)"
             self._mark_skipped(file_id, reason)
             await self._notify(
                 f"The agent produced {filename} but it is "
-                f"{size // (1024 * 1024)} MB, over Telegram's 50 MB bot limit. "
-                "Ask it to split or compress the file.",
+                f"{size // (1024 * 1024)} MB, over the "
+                f"{config.ARTIFACT_SPLIT_MAX_BYTES // (1024 * 1024)} MB ceiling for delivery "
+                "even in parts. Ask it to compress the file or produce a smaller one.",
                 is_error=True,
             )
             return
@@ -198,7 +205,7 @@ class ArtifactDeliverer:
         try:
             # Capped on the real bytes too: the declared size can be missing or wrong, and an
             # uncapped read into RAM is not survivable on a phone.
-            contents = await self.api.download(file_id, max_bytes=config.TG_UPLOAD_MAX_BYTES)
+            contents = await self.api.download(file_id, max_bytes=config.ARTIFACT_SPLIT_MAX_BYTES)
         except QoderError as exc:
             if exc.status == 403:
                 self._mark_skipped(file_id, "not downloadable")
@@ -219,8 +226,9 @@ class ArtifactDeliverer:
                 if notify:
                     await self._notify(
                         f"The agent produced {filename} but it is larger than the "
-                        f"{config.TG_UPLOAD_MAX_BYTES // (1024 * 1024)} MB delivery limit. "
-                        "Ask it to split or compress the file.",
+                        f"{config.ARTIFACT_SPLIT_MAX_BYTES // (1024 * 1024)} MB ceiling for "
+                        "delivery, even in parts. Ask it to compress the file or produce a "
+                        "smaller one.",
                         is_error=True,
                     )
                 return False
@@ -238,15 +246,14 @@ class ArtifactDeliverer:
     async def _send(
         self, file_id: str, filename: str, contents: bytes, *, notify: bool
     ) -> bool:
-        """Stage the bytes locally and hand them to Telegram."""
+        """Stage the bytes locally and hand them to Telegram, in parts if need be."""
         # Both components sanitised: the filename is agent-chosen and the file id comes from the
         # API, and either could carry a separator that escapes the scratch directory.
         safe_id = config.safe_path_component(file_id, "artifact")
         safe_name = config.safe_path_component(filename, f"{safe_id}.bin")
         dest = config.tmp_root() / f"{safe_id}_{safe_name}"
         try:
-            dest.write_bytes(contents)
-            # Retain a copy in the durable cache before the scratch file is cleaned up below.
+            # Retain a copy in the durable cache before any scratch file is cleaned up.
             # Without this the bytes exist nowhere after delivery, and a resumed conversation
             # could mention a file it had no way to provide again.
             history.retain_file(
@@ -257,7 +264,11 @@ class ArtifactDeliverer:
                 filename=safe_name,
                 owner_type="agent",
             )
-            message_id = await self._send_document_with_retry(dest, safe_name)
+            if len(contents) > config.TG_UPLOAD_MAX_BYTES:
+                message_id = await self._send_in_parts(safe_id, safe_name, contents)
+            else:
+                dest.write_bytes(contents)
+                message_id = await self._send_document_with_retry(dest, safe_name)
         except ChatGone:
             self._mark_skipped(file_id, "chat unreachable")
             return False
@@ -286,6 +297,43 @@ class ArtifactDeliverer:
         self._mark_delivered(file_id, message_id)
         log.info("delivered %s to chat %s", safe_name, self.chat_id)
         return True
+
+    async def _send_in_parts(self, safe_id: str, safe_name: str, contents: bytes) -> int | None:
+        """Send an over-50 MB artifact as numbered parts, each its own document.
+
+        Telegram measures the cap on the uploaded document, so part sizing leaves headroom
+        under it for the multipart framing. Failure semantics mirror the single-file path:
+        a permanent rejection propagates to ``_send`` and is recorded there, a transient one
+        returns None so the artifact stays pending — accepting that a later retry re-sends
+        EVERY part, since Telegram offers no idempotency to resume a half-sent sequence.
+        Duplicate parts beat a lost file. Returns the last part's message id.
+        """
+        part_bytes = config.TG_UPLOAD_PART_BYTES
+        total = -(-len(contents) // part_bytes)
+        await self._notify(
+            f"{safe_name} is {len(contents) / (1024 * 1024):.0f} MB, over Telegram's "
+            f"{config.TG_UPLOAD_MAX_BYTES // (1024 * 1024)} MB bot limit, so I am sending it "
+            f"in {total} parts named {safe_name}.001 ... {safe_name}.{total:03d}. "
+            f"To rejoin them: cat \"{safe_name}.\"* > \"{safe_name}\""
+        )
+        last_message_id: int | None = None
+        for index in range(total):
+            chunk = contents[index * part_bytes:(index + 1) * part_bytes]
+            part_name = f"{safe_name}.{index + 1:03d}"
+            part_path = config.tmp_root() / f"{safe_id}_{part_name}"
+            try:
+                part_path.write_bytes(chunk)
+                message_id = await self._send_document_with_retry(part_path, part_name)
+            finally:
+                _cleanup(part_path)
+            if message_id is None:
+                log.info(
+                    "part %d/%d of %s could not be sent; the artifact stays pending",
+                    index + 1, total, safe_name,
+                )
+                return None
+            last_message_id = message_id
+        return last_message_id
 
     async def _send_document_with_retry(self, dest: Path, filename: str) -> int | None:
         """Send the file, riding out one flood wait or one transient Telegram failure.
